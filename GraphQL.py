@@ -6,13 +6,13 @@ def _graphql_request(query: str, variables: dict = {}):
 
     Arguments:
         query {str} -- A GraphQL Query
-    
+
     Keyword Arguments:
         variables {dict} -- Optional Variables for the GraphQL Query (default: {{}})
-    
+
     Raises:
         Exception: Raises an exception if the response is anything other than 200.
-    
+
     Returns:
         dict -- Returns the JSON Response as a Dict.
     """
@@ -36,12 +36,11 @@ def _graphql_request(query: str, variables: dict = {}):
 
 
 def getStakingLedger(variables):
-    """Return the staking ledger"""
+    """Return the staking ledger."""
     query = '''query($delegate: String!, $ledgerHash: String!){
-  stakes(query: {delegate: $delegate, ledgerHash: $ledgerHash}, limit: 1000) {
+  stakes(query: {delegate: $delegate, ledgerHash: $ledgerHash}, limit: 2000) {
     public_key
     balance
-    epoch
     chainId
     timing {
       cliff_amount
@@ -62,9 +61,9 @@ def getStakingLedger(variables):
 
 
 def getBlocks(variables):
-    """Returns all blocks the pool won"""
+    """Returns all blocks the pool won."""
     query = """query($creator: String!, $epoch: Int, $blockHeightMin: Int, $blockHeightMax: Int, $dateTimeMin: DateTime, $dateTimeMax: DateTime){
-  blocks(query: {creator: $creator, protocolState: {consensusState: {epoch: $epoch}}, canonical: true, blockHeight_gte: $blockHeightMin, blockHeight_lte: $blockHeightMax, dateTime_gte:$dateTimeMin, dateTime_lte:$dateTimeMax, transactions: {userCommands: {from_ne: $creator}}, snarkJobs: {prover_ne: $creator}}, sortBy: DATETIME_DESC) {
+  blocks(query: {creator: $creator, protocolState: {consensusState: {epoch: $epoch}}, canonical: true, blockHeight_gte: $blockHeightMin, blockHeight_lte: $blockHeightMax, dateTime_gte:$dateTimeMin, dateTime_lte:$dateTimeMax}, sortBy: DATETIME_DESC, limit: 1000) {
     blockHeight
     canonical
     creator
@@ -74,6 +73,9 @@ def getBlocks(variables):
     receivedTime
     stateHash
     stateHashField
+    winnerAccount {
+      publicKey
+    }
     protocolState {
       consensusState {
         blockHeight
@@ -89,12 +91,13 @@ def getBlocks(variables):
       feeTransfer {
         fee
         recipient
+        type
       }
     }
   }
 }
 """
-    return (_graphql_request(query, variables))
+    return _graphql_request(query, variables)
 
 
 def getLatestHeight():
@@ -105,3 +108,24 @@ def getLatestHeight():
 }"""
 
     return (_graphql_request(query))
+
+
+def getLedgerHash(epoch: int) -> dict:
+    query = """query ($epoch: Int) {
+  blocks(query: {canonical: true, protocolState: {consensusState: {epoch: $epoch}}}, limit: 1) {
+    protocolState {
+      consensusState {
+        stakingEpochData {
+          ledger {
+            hash
+          }
+        }
+        epoch
+      }
+    }
+  }
+}"""
+    variables = {
+        "epoch": epoch
+    }
+    return _graphql_request(query, variables)
