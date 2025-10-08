@@ -1,3 +1,15 @@
 .venv
 .vscode
 __pycache__
+*.log
+*.tar
+*.bz2
+*.csv
+calc.sh
+config.yml
+withdraw.py
+
+logs/
+payouts/
+venv/
+
