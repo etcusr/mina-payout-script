@@ -1,0 +1,128 @@
+### ---------------------------------------------------------------------
+### Copy this file to config.yml and fill in your own values.
+### config.yml is gitignored - never commit it, it holds your addresses.
+### ---------------------------------------------------------------------
+
+### REWARDS CALCULATION ###
+
+# Public key of your block producer.
+VALIDATOR_ADDRESS: B62q...
+
+# Epoch is passed at runtime: calc_rewards.py --epoch N
+
+# Commission taken from regular blocks. 0.05 = 5%
+VALIDATOR_FEE: 0.05
+# Commission for supercharged blocks. Split among fully-unlocked delegators.
+# Supercharged rewards have been inactive on mainnet for years; kept for
+# completeness.
+VALIDATOR_FEE_SP: 0.05
+# Commission on stake delegated from the Mina Foundation.
+VALIDATOR_FEE_FOUNDATION: 0.05
+# Commission on stake delegated from O(1) Labs.
+VALIDATOR_FEE_O1LABS: 0.05
+
+# Block range for the epoch. Leave both at 0 to have them derived from the
+# archive database automatically - that is the normal setup.
+FIRST_BLOCK_HEIGHT: 0
+LATEST_BLOCK_HEIGHT: 0
+
+# Block depth required before a block is paid out.
+#
+# Measured over the whole Berkeley era on a full archive (211k reorg events):
+#   depth 1 -> 210,827   depth 4 -> 7
+#   depth 2 ->     339   depth 5 -> 1
+#   depth 3 ->      26   depth 6 -> 1   <- deepest real reorg in two years
+# (A 41-deep outlier in that data is the Mesa hard fork truncating the Berkeley
+#  tail, not a consensus reorg.)
+#
+# 20 gives a >3x margin over the worst case ever observed. Mina's protocol
+# finality is K=290, which is what the archive's chain_status='canonical'
+# means - roughly 17 hours of waiting. Raise this if you prefer that.
+CONFIRMATIONS_NUM: 20
+
+# Rewards below this many MINA are skipped (not worth the tx fee).
+MINIMUM_PAYOUT: 0.1
+
+# Slots per epoch. Mesa kept 7140, but slot time dropped from 180s to 90s,
+# so an epoch is now ~7.44 days instead of ~14.9.
+SLOTS_PER_EPOCH: 7140
+
+# Protocol era in the archive DB. Leave commented out - the current era
+# (highest protocol_version_id) is detected automatically. Uncomment only to
+# recalculate a historical epoch from an older era:
+#   1 = pre-Berkeley, 2 = Berkeley, 3 = Mesa
+# PROTOCOL_VERSION_ID: 3
+
+
+### CONNECTIONS ###
+
+# Mina daemon GraphQL. Use an SSH tunnel if the node is remote:
+#   ssh -N -L 3085:127.0.0.1:3085 user@your-node
+# This must point at the node that HOLDS THE WALLET KEY - payouts are signed
+# there. The VRF scanner additionally needs the block producer key.
+GRAPHQL_HOST: 127.0.0.1
+GRAPHQL_PORT: 3085
+
+# Mina archive Postgres. Tunnel it the same way if it is remote:
+#   ssh -N -L 5432:127.0.0.1:5432 user@your-node
+ARCHIVE_DB_URL: "postgresql://postgres:postgres@127.0.0.1:5432/archive"
+
+
+### PAYOUTS ###
+
+# Included in the payout memo, e.g. "e12-f1_mypool"
+VALIDATOR_NAME: mypool
+
+# The wallet that receives the coinbase and sends the payouts.
+# This is your daemon's --coinbase-receiver.
+SEND_FROM_ADDRESS: B62q...
+
+# Transaction fee in nanomina. 10000000 = 0.01 MINA
+DEFAULT_TX_FEE: 10000000
+
+# How long send_payout.py waits for its transactions to be included, in
+# seconds. Anything still unconfirmed is written to failed_payouts_<epoch>.csv
+TX_CHECK_TIMER_SECONDS: 2000
+
+# Wallet password is NOT stored here. send_payout.py and withdraw.py prompt
+# for it at runtime (hidden input, never lands in shell history).
+
+
+### WITHDRAW ###
+
+# Cold wallet the validator's commission is withdrawn to.
+# Can be overridden per run: withdraw.py --to B62q...
+WITHDRAW_TO_ADDRESS: B62q...
+# Memo attached to withdrawals. Empty is fine.
+WITHDRAW_MEMO: ""
+
+
+### PAYOUT REDIRECTS (optional) ###
+
+# A reward does not have to go to the address that holds the stake.
+#
+# Two things this solves:
+#   1. You stake from several of your own addresses and want everything landing
+#      on one, instead of collecting from all of them afterwards.
+#   2. An account is shared with someone and the reward has to be split.
+#
+# The share of the pool is still computed from the STAKING address - only the
+# destination of the transfer changes. Several staking addresses may resolve to
+# the same destination; their payouts are merged into one transaction.
+#
+# PAYOUT_REDIRECTS:
+#   # everything to a single address
+#   B62qMyStakingOne...: B62qMyMainWallet...
+#   B62qMyStakingTwo...: B62qMyMainWallet...
+#
+#   # split between two people
+#   B62qSharedAccount...:
+#     B62qPartner...:      50
+#     B62qMyMainWallet...: 50
+#
+# Shares are normalised, so 50/50, 0.5/0.5 and 1/1 all mean the same thing.
+# The last destination absorbs the rounding remainder, so the parts always add
+# back up to the original amount exactly.
+#
+# MINIMUM_PAYOUT is applied to the final merged transfer, not per delegator -
+# small shares that would be dropped on their own still count once combined.

@@ -1,9 +1,18 @@
-certifi==2020.12.5
-chardet==4.0.0
-dnspython==2.1.0
-idna==2.10
-requests==2.25.1
-tabulate==0.9.0
-urllib3==1.26.3
-pyyaml==5.4.1
-git+https://github.com/c29r3/coda-python-client.git
+# Core
+requests>=2.31
+pyyaml>=6.0
+tabulate>=0.9
+
+# Archive Postgres (GraphQL.py runs SQL against the mina-archive DB)
+psycopg2-binary>=2.9
+
+# Used by the vendored CodaClient in src/codaclient/
+websockets>=12.0
+
+# Progress bar while downloading ~280 MB staking ledgers (optional but nice)
+tqdm>=4.66
+
+# NOTE: coda-python-client used to be pulled from
+#   git+https://github.com/c29r3/coda-python-client.git
+# That repo is no longer reachable, and it isn't needed: the client is vendored
+# in src/codaclient/ and imported as `from src.codaclient import CodaClient`.

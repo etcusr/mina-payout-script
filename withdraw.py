@@ -9,34 +9,62 @@ with open("version", "r") as v_file:
     version = v_file.read()
 print(f'Script version: {version}')
 
-parser = argparse.ArgumentParser(description='Mina payouts sender')
-parser.add_argument('--epoch', required=True, type=int, help='epoch number')
+parser = argparse.ArgumentParser(description='Mina withdraw to cold wallet')
+parser.add_argument('--amount', required=True, type=float,
+                    help='amount in MINA to withdraw')
+parser.add_argument('--to', metavar='B62q...',
+                    help='destination address (default: WITHDRAW_TO_ADDRESS '
+                         'from config.yml)')
 args = parser.parse_args()
 
 c = yaml.load(open('config.yml', encoding='utf8'), Loader=yaml.SafeLoader)
 GRAPHQL_HOST      = str(c["GRAPHQL_HOST"])
 GRAPHQL_PORT      = str(c["GRAPHQL_PORT"])
 VALIDATOR_NAME    = str(c["VALIDATOR_NAME"])
-EPOCH             = int(args.epoch)
 default_fee       = int(c["DEFAULT_TX_FEE"])
 send_from         = str(c["SEND_FROM_ADDRESS"])
 TX_CHECK_TIMER    = int(c["TX_CHECK_TIMER_SECONDS"])
 
-WALLET_PASSWORD   = getpass.getpass(f'Wallet password for {send_from}: ')
+# Cold wallet - where the validator's commission is withdrawn to.
+# Set WITHDRAW_TO_ADDRESS in config.yml, or pass --to on the command line.
+TO_ADDRESS        = str(args.to or c.get("WITHDRAW_TO_ADDRESS") or "").strip()
+if not TO_ADDRESS:
+    exit("No destination address. Set WITHDRAW_TO_ADDRESS in config.yml "
+         "or pass --to B62q...")
 
-MEMO              = f'e{EPOCH}-f1_{VALIDATOR_NAME}'
-FILE_WITH_PAYOUTS = f'e{EPOCH}_payouts.csv'
+MEMO              = str(c.get("WITHDRAW_MEMO", ""))
 DECIMAL           = 1e9
 TIMEOUT           = 1
 TX_LIST_TO_CHECK  = []
-FAILED_PAYOUTS    = 0
-FAILED_PAYOUTS_FILE = f"failed_payouts_{EPOCH}.csv"
+FAILED_PAYOUTS_FILE = "failed_withdraw.csv"
 FAILED_PAYOUTS_LST  = []
+
+amount_nanomina = int(args.amount * DECIMAL)
+amount_mina = amount_nanomina / DECIMAL
+
+WALLET_PASSWORD   = getpass.getpass(f'Wallet password for {send_from}: ')
 
 graphql = MinaClient(graphql_host=GRAPHQL_HOST, graphql_port=GRAPHQL_PORT)
 
-print(f"Epoch: {EPOCH}")
 print(graphql.get_wallets())
+
+# Show the current balance for reference only - do NOT rely on it, there may
+# be pending payouts that are not reflected yet
+try:
+    wallet = graphql.get_wallet(send_from)
+    balance_nanomina = int(wallet["wallet"]["balance"]["total"])
+    balance_mina = balance_nanomina / DECIMAL
+    print(f'Current balance: {balance_mina} MINA (note: pending payouts not subtracted)')
+except Exception as e:
+    print(f'Could not fetch balance ({e}), continuing anyway')
+
+print(f'Will send: {amount_mina} MINA --> {TO_ADDRESS}')
+print(f'Tx fee: {default_fee / DECIMAL} MINA')
+
+confirm = input('Confirm withdraw? [y/N]: ').strip().lower()
+if confirm != 'y':
+    exit('Aborted by user')
+
 try:
     graphql.unlock_wallet(send_from, WALLET_PASSWORD)
 except:
@@ -52,33 +80,16 @@ def send_transaction(to_address, amount_nanomina, from_address=send_from,  fee_n
                                      amount=amount_nanomina,
                                      fee=fee_nanomina,
                                      memo=memo)
-    # pprint.pprint(trans_res)
     return trans_res
 
 
-with open(FILE_WITH_PAYOUTS, "r") as payout_file:
-    payout_lst = payout_file.read().split("\n")
-    payout_lst = list(filter(None, payout_lst))
-
-for i, p in enumerate(payout_lst, start=1):
-    p = p.split(";")
-    delegator_addr = p[0]
-    payout_in_nanomina = int(p[1])
-    payout_in_mina = float(p[2])
-    is_it_foundation = p[3]
-
-    print(f'{i}\\{len(payout_lst)} '
-          f'{payout_in_mina} MINA --> https://minaexplorer.com/wallet/{delegator_addr}')
-
-    # PAYOUTS STARTS HERE
-    hash_result = send_transaction(
-        to_address=delegator_addr,
-        amount_nanomina=payout_in_nanomina)
-
-    with open(f"sended_txs_e{EPOCH}.csv", "a") as tx_result:
-        tx_result.write(f"{hash_result}\n")
-    TX_LIST_TO_CHECK.append(hash_result)
-    time.sleep(TIMEOUT)
+# Send to cold wallet
+hash_result = send_transaction(
+        to_address=TO_ADDRESS,
+        amount_nanomina=amount_nanomina,
+    )
+TX_LIST_TO_CHECK.append(hash_result)
+print(hash_result)
 
 
 print(f'Trying to lock wallet: {send_from}')
@@ -111,15 +122,15 @@ while len(TX_LIST_TO_CHECK):
             TX_CHECK_TIMER -= time.time() - t1
             continue
 
-        # elif "pending" in str(tx_data) or "PENDING" in str(tx_data):
-        #     print(f'Tx has pending status: https://minaexplorer.com/payment/{tx_hash}')
+        elif "pending" in str(tx_data) or "PENDING" in str(tx_data):
+            print(f'Tx has pending status: https://minaexplorer.com/payment/{tx_hash}')
 
-        if "INCLUDED" in str(tx_data) or "included" in str(tx_data):
+        elif "INCLUDED" in str(tx_data) or "included" in str(tx_data):
             print(f'Transaction sent successfully: https://minaexplorer.com/payment/{tx_hash}')
             TX_LIST_TO_CHECK.remove(tx)
 
-        # else:
-        #     print(f'Else triggered: {tx_data}')
+        else:
+            print(f'Else triggered: {tx_data}')
 
         time.sleep(1)
 

@@ -1,0 +1,9 @@
+# Cached block JSONs + staking ledger JSONs from gs://*
+# Regenerated on demand, no point storing in git.
+cache/
+*.log
+*.lock
+dumps/
+backfill-*/
+pgdata/
+follower-config/

@@ -1,15 +1,49 @@
-.venv
-.vscode
-__pycache__
+# NOTE: git only treats '#' as a comment at the START of a line.
+# An inline '#' becomes part of the pattern and silently breaks it.
+
+# --- private: never commit -------------------------------------------------
+# addresses, DB credentials, payout redirects
+config.yml
+*.env
+*.key
+*.json.key
+keys/
+
+# --- generated payout data (contains delegator addresses) ------------------
+*.csv
+payouts/
+logs/
+vrf/*.json
+failed_withdraw.csv
+
+# --- caches: huge and re-downloadable --------------------------------------
+archive/cache/
+archive/pgdata/
+archive/bootstrap-tmp/
+archive/guardian-tmp/
+archive/follower-config/
+
+# --- python ----------------------------------------------------------------
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# --- scratch ---------------------------------------------------------------
 *.log
 *.tar
+*.tar.gz
 *.bz2
-*.csv
-calc.sh
-config.yml
-withdraw.py
+Claude outputs/
 
-logs/
-payouts/
-venv/
+# upstream MinaProtocol/mina clone, not part of this repo
+mina/
 
+# old vendored client, replaced by mina_client.py
+src/
+
+# --- editors / OS ----------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
