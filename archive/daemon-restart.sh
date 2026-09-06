@@ -1,13 +1,13 @@
 #!/bin/bash
-# DEPRECATED — этот файл больше не нужен.
+# DEPRECATED - this file is no longer needed.
 #
-# Изначально мы планировали пересоздать существующий `mina` контейнер
-# (block producer) с флагом --archive-address. Но это бы означало
-# перерыв в работе продьюсера, чего мы делать не хотим.
+# The original plan was to recreate the existing `mina` container (the block
+# producer) with an --archive-address flag. That would have meant downtime for
+# the producer, which is not acceptable.
 #
-# Вместо этого в docker-compose.yml поднимается отдельный mina-follower
-# (non-producer daemon), который сам синхронит цепь и шлёт блоки в архив.
-# Producer вообще не трогается.
+# Instead docker-compose.yml brings up a separate non-producing mina-follower
+# that syncs the chain itself and feeds blocks to the archive. The producer is
+# left completely untouched.
 #
-# См. README.md.
+# See README.md.
 exit 1

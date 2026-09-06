@@ -1,5 +1,7 @@
 # mina-payout-script
 
+**English** · [Русский](README.ru.md)
+
 Reward calculation and payout tooling for a [Mina Protocol](https://minaprotocol.com)
 block producer, working against **your own archive node** instead of third-party
 explorer APIs.

@@ -1,10 +1,10 @@
 # DEPRECATED
 
-После перехода на официальный compose с `bootstrap_db` схема приходит вместе
-с самим SQL-дампом от Mina Foundation. Отдельный `create_schema.sql` больше
-не нужен.
+Since moving to the official compose setup with `bootstrap_db`, the schema
+arrives together with the SQL dump published by the Mina Foundation. A separate
+`create_schema.sql` is no longer needed.
 
-Папка оставлена для истории, можно удалить:
+This directory is kept for historical reasons and can be removed:
 
 ```bash
 rm -rf init-scripts/

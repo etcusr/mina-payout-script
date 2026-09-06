@@ -1,158 +1,169 @@
-# Mina Archive Node Setup
+# Mina Archive Node
 
-Архив, отдельный от твоего block producer'а. Поднимается тремя контейнерами
-на сервере, на изолированной сети `mina-net`. Producer (`mina`) на `bridge` —
-его не трогаем вообще, его 19h аптайма сохраняется.
+**English** · [Русский](README.ru.md)
 
-## Архитектура
+A self-hosted archive node, kept completely separate from your block producer.
+The payout scripts read their block data from this node's Postgres instead of
+from public explorer APIs, which have a habit of disappearing.
+
+## Architecture
+
+The stack runs on its own docker network, `mina-net`. A block producer normally
+sits on the default `bridge` network and is never touched, so its uptime is not
+affected.
 
 ```
-[bridge, как было]
-  └─ mina (block producer)  ← uptime сохраняется
+[bridge - untouched]
+  └─ mina                 your block producer
 
-[mina-net, новая]
-  ├─ mina-follower    non-producer daemon, сам синхронит сеть
-  │                   и шлёт каждый блок в --archive-address
-  ├─ mina-archive     слушает 3086, парсит, пишет в postgres
-  └─ postgres         5432 на хосте (для SSH-туннеля с мака)
+[mina-net - this stack]
+  ├─ postgres             archive database, exposed on 127.0.0.1:5432
+  ├─ bootstrap_db         one-shot: downloads and restores a mainnet dump
+  ├─ mina_archive         listens on 3086, writes incoming blocks to Postgres
+  ├─ mina_node            non-producing daemon, syncs the chain, feeds the archive
+  └─ missing_blocks_guardian
+                          backfills gaps from precomputed-block CDNs
 ```
 
-## Файлы
+## Files
 
 ```
 archive/
-├── docker-compose.yml      Postgres + mina-archive + mina-follower
-├── init-scripts/
-│   ├── README.md           инструкция как скачать SQL ниже
-│   ├── 00-create_schema.sql   (скачать вручную)
-│   └── 01-zkapp_tables.sql
-├── follower-config/        ~/.mina-config follower'а (создаётся автоматом)
-├── pgdata/                 данные Postgres (создаётся автоматом)
-├── daemon-restart.sh       DEPRECATED, не используем
-└── README.md               этот файл
+├── docker-compose.yml       the whole stack
+├── scripts/
+│   └── blocks-guardian.sh   gap filler with CDN fallback (see below)
+├── backfill-epoch.sh        bulk-import a historical height range
+├── mina-archive-refresh.sh  restore a newer dump when one is published
+├── init-scripts/            legacy, no longer needed
+├── pgdata/                  Postgres data (created automatically)
+├── follower-config/         the follower's .mina-config (created automatically)
+└── daemon-restart.sh        DEPRECATED, kept for reference only
 ```
 
-## Установка
+## Install
 
-### Шаг 1 — залить файлы на сервер
+### 1. Copy the stack to the server
 
 ```bash
-# С твоего мака
-rsync -av --exclude pgdata --exclude follower-config --exclude '*.log' --exclude '*.lock' --exclude dumps --exclude cache \
-  ~/Documents/projects/python/Mina/mina-payout-script/archive/ \
-  your-node:~/mina-archive/
+rsync -av --exclude pgdata --exclude follower-config --exclude cache \
+  ./archive/ your-node:~/mina-archive/
 ```
 
-### Шаг 2 — скачать schema SQL
+### 2. Open the libp2p port
+
+The follower daemon needs inbound libp2p connections. It uses **8303** so it
+cannot clash with a producer already using 8302.
 
 ```bash
-ssh your-node
-cd ~/mina-archive/init-scripts/
-
-curl -fsSL -o 00-create_schema.sql \
-  https://raw.githubusercontent.com/MinaProtocol/mina/4e62fc2/src/app/archive/create_schema.sql
-
-ls -la   # должно быть ~24 KB
-```
-
-В 3.0.x все таблицы (включая zkapp_*) уже в одном `create_schema.sql`.
-Отдельный `zkapp_tables.sql` появился в более поздних релизах.
-
-### Шаг 3 — открыть порт 8303 на сервере
-
-Чтобы follower-демон мог делать входящие libp2p-соединения:
-
-```bash
-# Если у тебя ufw:
 sudo ufw allow 8303/tcp
-# Или iptables / хостер firewall — нужен публичный 8303 TCP
 ```
 
-(8302 уже открыт у твоего producer'а, оставляем как есть.)
-
-### Шаг 4 — поднять стек
+### 3. Start it
 
 ```bash
 cd ~/mina-archive
 docker compose up -d
-
-# Через ~30 сек проверь
 docker compose ps
-# postgres: healthy
-# archive:  running
-# follower: running
 ```
 
-### Шаг 5 — проверки
+`bootstrap_db` downloads a mainnet dump (several GB) and restores it. That takes
+a while on first run; the other containers wait for it to finish.
+
+### 4. Check
 
 ```bash
-# Схема накатилась
-docker exec mina-archive-pg psql -U mina -d archive -c '\dt' | head -30
-# должны быть blocks, public_keys, user_commands, internal_commands, zkapp_*
+# Tables are in place
+docker exec mina-archive-pg psql -U postgres -d archive -c '\dt' | head -30
 
-# Archive слушает
+# The archive process is listening
 docker logs mina-archive 2>&1 | tail -20
-# должно быть про "Initializing archive process" + listening on 3086
 
-# Follower начал sync (займёт 1-3 часа)
+# The follower is syncing
 docker logs --tail 30 -f mina-follower
-# ищем "Block produced/received", "Catching up", "Best tip changed"
 
-# Когда follower поймает текущий tip — увидим в Postgres новые блоки
-watch -n 10 "docker exec mina-archive-pg psql -U mina -d archive -c \
+# Blocks are arriving
+watch -n 10 "docker exec mina-archive-pg psql -U postgres -d archive -c \
   \"SELECT COUNT(*) AS blocks, MAX(height) AS tip FROM blocks;\""
 ```
 
-## Что дальше
+The follower takes a few hours to catch up to the current tip. From then on
+every new block lands in Postgres automatically.
 
-- Через 1-3 часа follower синхронится до текущего tip
-- С этого момента **каждый новый блок** автоматом летит в Postgres
-- Когда epoch 47 закончится — все её блоки уже у нас в БД
-- Тогда переписываем `GraphQL.py` на SQL (см. Phase 3 ниже)
+## The block guardian
 
-## Phase 3 — переписать GraphQL.py на SQL (когда archive накопит блоки)
+The Mina Foundation ships a `missing-blocks-guardian` script that fills gaps in
+the archive from a bucket of precomputed blocks. It hardcodes a single S3
+bucket, and when the Foundation deleted that bucket the script began retrying
+the same missing block forever — hundreds of log lines per second, no progress,
+indefinitely.
 
-1. Обновить SSH-туннель чтобы пробросить 5432:
-   ```bash
-   alias tunnel_mina='tmux new -s minatun -d "ssh your-node -N -L 3085:localhost:3085 -L 5432:localhost:5432"'
-   ```
+`scripts/blocks-guardian.sh` replaces it:
 
-2. В `config.yml` добавить:
-   ```yaml
-   ARCHIVE_DB_URL: "postgresql://mina:IYF32rfIYFFOr38o7f2@127.0.0.1:5432/archive"
-   ```
+- tries several mirrors in order (GCS first, then S3)
+- validates the JSON before handing it to `mina-archive-blocks`
+- blacklists blocks that are unavailable everywhere instead of looping on them
+- asks the daemon which blocks are actually missing rather than guessing
 
-3. В venv поставить psycopg2:
-   ```bash
-   source venv/bin/activate
-   pip install psycopg2-binary
-   ```
+To add another mirror, append to the `SOURCES` array in that script.
 
-4. Скажешь — перепишу `GraphQL.getBlocks` на SQL к archive-схеме.
-   `getStakingLedger` можно оставить на GCS bucket — 286МБ JSON-а раз в эпоху это терпимо.
+## Connecting the payout scripts
 
-## Бэкап и обслуживание
+The scripts talk to `127.0.0.1`, so tunnel both ports from your workstation:
 
 ```bash
-# Дамп
-docker exec mina-archive-pg pg_dump -U mina archive | gzip > archive-$(date +%F).sql.gz
+./scripts/tunnel.sh your-node --bg
+```
 
-# Размер БД
-docker exec mina-archive-pg psql -U mina -d archive -c \
+Then in `config.yml`:
+
+```yaml
+ARCHIVE_DB_URL: "postgresql://postgres:<password>@127.0.0.1:5432/archive"
+```
+
+Use whatever `POSTGRES_PASSWORD` you set in `docker-compose.yml`. The default in
+the committed file is `postgres`, which is fine while the port is bound to
+`127.0.0.1` only — change it if you expose the database at all.
+
+## Maintenance
+
+```bash
+# Back up
+docker exec mina-archive-pg pg_dump -U postgres archive | gzip > archive-$(date +%F).sql.gz
+
+# Database size
+docker exec mina-archive-pg psql -U postgres -d archive -c \
   "SELECT pg_size_pretty(pg_database_size('archive'));"
 
-# Остановить ВСЕ компоненты архива (producer не затрагивается)
+# Stop the archive stack (the producer is not affected)
 cd ~/mina-archive && docker compose down
 
-# Полностью снести (с потерей данных)
+# Wipe everything, including data
 cd ~/mina-archive && docker compose down -v && rm -rf pgdata follower-config
 ```
 
-## Откат / если что-то пошло не так
+### Moving to a newer dump
+
+The Foundation publishes a mainnet dump roughly monthly. To rebuild from a newer
+one, update `DUMP_DATE` in `docker-compose.yml` and recreate the database, or
+use `mina-archive-refresh.sh`.
+
+### Importing a historical range
+
+`backfill-epoch.sh` pulls a height range straight from the precomputed-block
+bucket and imports it, which is useful when you need epochs older than your
+dump. It expects the database password in the environment:
+
+```bash
+PGPASSWORD=... ./backfill-epoch.sh <min-height> <max-height>
+```
+
+## Rollback
 
 ```bash
 cd ~/mina-archive
 docker compose down
-# producer-контейнер `mina` остался в бridge-сети, работает как работал
-docker ps | grep mina   # должен быть только producer
+docker ps | grep mina    # only the producer should remain
 ```
+
+The producer container stays on the default bridge network throughout and is
+never reconfigured by this stack.

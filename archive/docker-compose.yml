@@ -1,19 +1,15 @@
-# Official Mina Foundation archive stack (адаптированный):
-#   - postgres (с накатанным свежим mainnet-дампом)
-#   - bootstrap_db (one-shot: качает дамп + накатывает + тюнит pg.conf)
-#   - missing_blocks_guardian (фоном дотягивает пропуск между датой дампа и live tip
-#                              из gs://mina-precomputed-blocks)
-#   - mina_archive (слушает 3086, принимает блоки от mina_node)
-#   - mina_node (non-producer daemon, синхронит цепь, шлёт блоки в archive)
+# Mina archive stack, adapted from the Mina Foundation reference setup:
+#   - postgres                 seeded from a recent mainnet dump
+#   - bootstrap_db             one-shot: downloads the dump, restores it, tunes pg.conf
+#   - missing_blocks_guardian  fills the gap between the dump date and the live tip
+#   - mina_archive             listens on 3086, receives blocks from mina_node
+#   - mina_node                non-producing daemon, syncs the chain, feeds the archive
 #
-# Producer (`mina` контейнер на default `bridge`) НЕ затрагивается.
-# Эта инсталляция работает на отдельной docker-сети `mina-net`.
+# Your block producer is NOT touched: this stack runs on its own docker network
+# `mina-net`, while a producer container normally sits on the default bridge.
 #
-# Версии: 3.3.0-8c0c2e6-bullseye-mainnet для archive/daemon — соответствует
-# тегу, которым публикуются эти SQL-дампы.
-#
-# Дамп прописан жёстко — Foundation публикует mainnet-дамп раз в месяц около
-# 9-го числа. Чтобы переключиться на следующий — обнови переменную DUMP_DATE.
+# The dump date is pinned on purpose. The Foundation publishes a mainnet dump
+# roughly monthly, around the 9th. To move to a newer one, update DUMP_DATE.
 
 services:
   postgres:
@@ -40,7 +36,7 @@ services:
     image: minaprotocol/mina-archive:3.3.0-8c0c2e6-bullseye-mainnet
     container_name: mina-bootstrap-db
     environment:
-      # Update это поле когда Foundation выложит более свежий дамп
+      # Bump this when the Foundation publishes a newer dump
       DUMP_DATE: "2026-05-09_0700"
       DUMP_URL_BASE: "https://storage.googleapis.com/mina-archive-dumps"
     command: >
@@ -50,27 +46,27 @@ services:
       DUMP_FILE="mainnet-archive-dump-$$DUMP_DATE.sql.tar.gz";
       SQL_FILE="mainnet-archive-dump-$$DUMP_DATE.sql";
       if [ ! -f "$$SQL_FILE" ]; then
-        echo "Скачиваю $$DUMP_FILE...";
+        echo "Downloading $$DUMP_FILE...";
         curl -fL -o "$$DUMP_FILE" "$$DUMP_URL_BASE/$$DUMP_FILE";
-        echo "Распаковываю...";
+        echo "Extracting...";
         tar -zxvf "$$DUMP_FILE";
       fi;
-      echo "Проверяю — БД уже накатана?";
+      echo "Is the database already populated?";
       BLOCKS=$$(psql postgres://postgres:postgres@postgres:5432/archive -tAc "SELECT COUNT(*) FROM blocks" 2>/dev/null || echo 0);
       if [ "$$BLOCKS" -gt 1000 ]; then
-        echo "БД уже содержит $$BLOCKS блоков, skip restore";
+        echo "Database already holds $$BLOCKS blocks, skipping restore";
         exit 0;
       fi;
-      echo "Тюню postgres для большого рестора...";
+      echo "Tuning postgres for a large restore...";
       PG=postgres://postgres:postgres@postgres:5432/archive;
       psql "$$PG" -c "ALTER SYSTEM SET max_connections = 500";
       psql "$$PG" -c "ALTER SYSTEM SET max_locks_per_transaction = 100";
       psql "$$PG" -c "ALTER SYSTEM SET max_pred_locks_per_relation = 100";
       psql "$$PG" -c "ALTER SYSTEM SET max_pred_locks_per_transaction = 5000";
       psql "$$PG" -c "SELECT pg_reload_conf()";
-      echo "Накатываю SQL...";
+      echo "Restoring SQL...";
       psql postgres://postgres:postgres@postgres:5432/archive -f "$$SQL_FILE";
-      echo "Done. Размер БД:";
+      echo "Done. Database size:";
       psql postgres://postgres:postgres@postgres:5432/archive -c "SELECT pg_size_pretty(pg_database_size('"'"'archive'"'"'));";
       psql postgres://postgres:postgres@postgres:5432/archive -c "SELECT COUNT(*) AS blocks, MAX(height) AS tip FROM blocks;";
       '
@@ -86,11 +82,11 @@ services:
     image: minaprotocol/mina-archive:3.3.0-8c0c2e6-bullseye-mainnet
     container_name: mina-missing-blocks-guardian
     restart: unless-stopped
-    # Своя реализация вместо foundation'овского скрипта с гитхаба:
-    #  - fallback по нескольким источникам (GCS → S3 → ...)
-    #    потому что Foundation любит сносить S3 ведра
-    #  - blacklist навечно сломанных блоков, чтобы не зацикливаться
-    #  - логика в ./scripts/blocks-guardian.sh
+    # Custom implementation instead of the Foundation's script from GitHub:
+    #  - falls back across several block sources (GCS, then S3, ...), because
+    #    the Foundation has a habit of deleting buckets
+    #  - blacklists permanently broken blocks instead of retrying them forever
+    #  - see ./scripts/blocks-guardian.sh
     environment:
       PG_CONN: postgres://postgres:postgres@postgres:5432/archive
       DAEMON_URL: http://mina_node:3085/graphql
@@ -136,17 +132,17 @@ services:
     image: minaprotocol/mina-daemon:3.3.0-8c0c2e6-bullseye-mainnet
     container_name: mina-follower
     restart: unless-stopped
-    # Prover/verifier у Mina хорошо жрут shared memory. Дефолтный /dev/shm в
-    # docker = 64MB — упирается. Поднимаем.
+    # Mina's prover/verifier are hungry for shared memory. Docker's default
+    # /dev/shm is 64MB, which is not enough - raise it.
     shm_size: 4g
-    # ulimit увеличиваем, т.к. mina открывает много файлов и сокетов
+    # mina opens a lot of files and sockets, so raise the fd limit too
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
-    # Не оверрайдим entrypoint — используем стандартный /entrypoint.sh из образа.
-    # Просто передаём аргументы как Cmd. Так делает официальный compose в их docs.
-    # libp2p порт 8303 чтобы НЕ конфликтовать с твоим producer'ом на 8302.
+    # The image's own /entrypoint.sh is kept; we only pass arguments as Cmd,
+    # the same way the official compose file does.
+    # libp2p uses 8303 here so it cannot clash with a producer on 8302.
     command:
       - daemon
       - --archive-address
@@ -158,10 +154,10 @@ services:
       - "3085"
       - --external-port
       - "8303"
-      # NB: без --stop-time mina-daemon отключается через ~7 дней (костыль
-      # mainnet'а для non-producer нод). restart: unless-stopped автоматически
-      # поднимет контейнер обратно, persistent_frontier сохраняется в
-      # ./follower-config/ → следующий старт = быстрый fast-forward, не bootstrap.
+      # NB: without --stop-time a mina daemon shuts itself down after ~7 days
+      # (a mainnet quirk for non-producing nodes). `restart: unless-stopped`
+      # brings it back, and persistent_frontier lives in ./follower-config/,
+      # so the next start is a fast-forward rather than a full bootstrap.
     ports:
       - "8303:8303"
     volumes:
