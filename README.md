@@ -325,12 +325,25 @@ commission.
 
 ## Confirmations and reorg safety
 
-A block only becomes spendable-safe once it is deep enough that a chain reorg
-cannot remove it. Mina's protocol finality is **K=290** — that is what the
-archive's `chain_status='canonical'` means, and it costs roughly 17 hours of
-waiting.
+A confirmation here means **a block built on top of yours** - that is, your
+block is an ancestor of the current best tip. That is deliberately not the same
+as "the tip is N heights above you".
 
-Measured on a full archive across the entire Berkeley era, 211,202 reorg events:
+This distinction is the whole game. Mina lets more than one producer win the
+same slot, and the loser's block simply never gains descendants. Meanwhile the
+archive keeps every block marked `pending` until it is K=290 deep, so for about
+17 hours a dead branch is indistinguishable from a live one *by status alone*.
+Counting `tip_height - block_height` would report a block on a losing branch as
+having hundreds of confirmations while nothing was ever built on it.
+
+So confirmations are resolved by walking parent links back from the daemon's
+best tip. A block off that chain gets zero confirmations immediately, and is
+excluded from payouts long before the archive gets around to labelling it
+`orphaned`.
+
+That is what makes a small `CONFIRMATIONS_NUM` safe. The remaining risk is a
+genuine deep reorg, and there is data on how deep those go. Measured on a full
+archive across the entire Berkeley era, 211,202 reorg events:
 
 | Reorg depth | Occurrences |
 | --- | --- |
@@ -341,14 +354,35 @@ Measured on a full archive across the entire Berkeley era, 211,202 reorg events:
 | 5 | 1 |
 | 6 | 1 |
 
-The deepest genuine reorg in two years was **6 blocks**. (A 41-deep outlier also
-shows up in that data, but it is the Mesa hard fork truncating the Berkeley
-tail, not a consensus reorg.)
+The deepest genuine reorg in two years was **6 blocks**. (A 41-deep outlier
+also shows up, but that is the Mesa hard fork truncating the Berkeley tail, not
+a consensus reorg.)
 
 `CONFIRMATIONS_NUM: 20` therefore carries more than a 3x margin over the worst
 case ever observed, while cutting the wait from ~17 hours to under an hour. Set
 it to 290 if you want strict protocol finality; the Mina Foundation's own
 guidance for exchanges is 15.
+
+### Orphan rates are high, and that is normal
+
+Because several producers can win the same slot, a large share of all blocks
+produced never make it into the chain. From the same archive:
+
+| Era | Canonical | Orphaned | Orphan rate |
+| --- | --- | --- | --- |
+| Berkeley, mid-2024 | 20,000 | 37,793 | 65% |
+| Berkeley, 2025 | 20,000 | 12,318 | 38% |
+| Berkeley, 2026 | 19,565 | 10,962 | 36% |
+| Mesa | 1,103 | 682 | 38% |
+
+For comparison, Bitcoin orphans about 0.5% of blocks and pre-Merge Ethereum
+uncled 5-10%. The rate improved a lot over Berkeley and Mesa's 90-second slots
+did **not** make it worse, despite halving the propagation window.
+
+Nothing is burned when a Mina block is orphaned - it is lost opportunity, not
+lost work. But it does mean a won VRF slot is not the same as a paid block,
+which is why `calc_rewards.py --vrf` shows an expectation adjusted by your
+historical orphan rate alongside the raw VRF total.
 
 ## Mesa hard fork notes
 

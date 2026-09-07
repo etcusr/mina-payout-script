@@ -166,10 +166,11 @@ if report:
         rows = []
         for b in b_list:
             ts = datetime.datetime.utcfromtimestamp(b["ts"] / 1000).strftime("%Y-%m-%d %H:%M")
-            if b["chain_status"] == "orphaned":
+            if b.get("lost"):
                 orphans.append(b)
                 mark, col = "x", C.RED
-                note = "orphaned, no reward"
+                note = ("orphaned, no reward" if b["chain_status"] == "orphaned"
+                        else "off best chain, no reward")
             elif b["mature"]:
                 mature.append(b)
                 mark, col = "+", C.GREEN
@@ -255,6 +256,28 @@ if report:
         print(f"  {C.BOLD}VRF: {len(won)} won slot(s) this epoch{C.RESET} "
               f"{C.GREY}({produced} passed, {len(ahead)} ahead) "
               f"= {gross_all:g} MINA gross total{C.RESET}")
+
+        # A won slot only pays if the block survives. Roughly a third of all
+        # blocks produced on mainnet end up orphaned, so the VRF number is an
+        # upper bound rather than an expectation.
+        if ahead:
+            orate = GraphQL.getOrphanRate(public_key)
+            own, net = orate.get("own"), orate.get("network")
+            src = None
+            if own and (own["won"] + own["lost"]) >= 50:
+                src, label = own, "your history"
+            elif net:
+                src, label = net, "network history"
+            if src:
+                expected = len(ahead) * COINBASE * (1 - src["rate"])
+                already = produced * COINBASE
+                print(f"      {C.GREY}{len(ahead)} slot(s) ahead x {COINBASE:g} = "
+                      f"{len(ahead)*COINBASE:g} MINA if all survive; at the "
+                      f"{src['rate']*100:.0f}% orphan rate of {label} "
+                      f"({src['lost']:,}/{src['won']+src['lost']:,}) "
+                      f"expect ~{expected:,.0f}{C.RESET}")
+                print(f"      {C.GREY}so realistic epoch total is around "
+                      f"{already + expected:,.0f} MINA, not {gross_all:g}{C.RESET}")
         if ahead:
             payout_now = False
             for s in ahead:
@@ -315,7 +338,7 @@ if report:
                   f"{C.GREY}(nonce {bal['nonce']} -> {bal['inferred_nonce']}){C.RESET}")
         if b_list:
             unpaid = sum(b["coinbase_mina"] for b in b_list
-                         if b["chain_status"] != "orphaned")
+                         if not b.get("lost"))
             print(f"  {C.GREY}of which ~{unpaid:,.0f} MINA is this epoch's coinbase, "
                   f"still owed to delegators{C.RESET}")
 

@@ -100,6 +100,11 @@ _pv_cache = None
 def _confirmations():
     """How many blocks deep a block must be before we pay it out.
 
+    A confirmation here means a block built ON TOP of ours, i.e. our block is
+    an ancestor of the current best tip. That is not the same as "the tip is N
+    heights above us": a block sitting on a losing branch never gains a single
+    real confirmation, no matter how far the winning chain runs ahead.
+
     Empirical basis (measured on this archive, whole Berkeley era, 211k events):
         depth 1 -> 210,827   depth 4 -> 7
         depth 2 ->     339   depth 5 -> 1
@@ -108,9 +113,10 @@ def _confirmations():
     fork cutting off the Berkeley tail, not a consensus reorg.)
 
     Mina's protocol finality is K=290, which is what chain_status='canonical'
-    reflects. That is ~17h of waiting. CONFIRMATIONS_NUM trades that for a
-    depth-based threshold; 20 gives a >3x margin over the worst reorg ever
-    observed while cutting the wait to under an hour.
+    reflects - about 17h of waiting. With ancestry-checked confirmations, 20
+    gives a >3x margin over the worst reorg ever observed at a fraction of the
+    wait, because a block off the best chain is rejected immediately rather
+    than after K.
     """
     return int(_config().get("CONFIRMATIONS_NUM", 20))
 
@@ -122,6 +128,87 @@ def getChainTip():
         (_protocol_version_id(),),
     )
     return int(h or 0)
+
+
+_best_chain_cache = None
+
+
+def _best_chain(min_height=None):
+    """Block ids on the current best chain, walking parents back from the tip.
+
+    Returns {"ids": set(), "tip_height": int, "tip_hash": str}.
+
+    The archive marks a block canonical or orphaned only once it is K=290 deep;
+    until then everything is 'pending', including blocks on branches that have
+    already lost. Walking the parent links from the daemon's best tip tells us
+    the truth immediately, which is what makes a small CONFIRMATIONS_NUM safe.
+
+    The tip is taken from the daemon when reachable, since it is authoritative
+    about which branch won. Otherwise we fall back to the archive's own highest
+    block, preferring one that already has descendants.
+    """
+    global _best_chain_cache
+    if _best_chain_cache is not None and (
+            min_height is None or _best_chain_cache["min_height"] <= min_height):
+        return _best_chain_cache
+
+    pv_id = _protocol_version_id()
+    tip_hash = None
+    try:
+        j = _daemon_query("{ bestChain(maxLength: 1) { stateHash } }")
+        chain = (j.get("data") or {}).get("bestChain") or []
+        if chain:
+            tip_hash = chain[0]["stateHash"]
+    except Exception as e:
+        _log(f"  (daemon unreachable for best tip: {e}; using archive tip)")
+
+    tip_row = None
+    if tip_hash:
+        rows = _query_dict(
+            "SELECT id, height FROM blocks WHERE state_hash = %s", (tip_hash,))
+        tip_row = rows[0] if rows else None
+        if not tip_row:
+            _log("  (daemon tip not in archive yet; using archive tip)")
+
+    if not tip_row:
+        rows = _query_dict(
+            """
+            SELECT b.id, b.height
+            FROM blocks b
+            WHERE b.protocol_version_id = %(pv)s
+              AND b.height = (SELECT MAX(height) FROM blocks
+                              WHERE protocol_version_id = %(pv)s)
+            ORDER BY (SELECT count(*) FROM blocks c WHERE c.parent_id = b.id) DESC,
+                     b.id DESC
+            LIMIT 1
+            """, {"pv": pv_id})
+        tip_row = rows[0] if rows else None
+
+    if not tip_row:
+        return {"ids": set(), "tip_height": 0, "tip_hash": None, "min_height": 0}
+
+    floor = int(min_height) if min_height is not None else 0
+    rows = _query_dict(
+        """
+        WITH RECURSIVE chain AS (
+          SELECT id, parent_id, height FROM blocks WHERE id = %(tip_id)s
+          UNION ALL
+          SELECT b.id, b.parent_id, b.height
+          FROM blocks b JOIN chain c ON b.id = c.parent_id
+          WHERE b.height >= %(floor)s
+        )
+        SELECT id FROM chain
+        """, {"tip_id": tip_row["id"], "floor": floor})
+
+    _best_chain_cache = {
+        "ids": {int(r["id"]) for r in rows},
+        "tip_height": int(tip_row["height"]),
+        "tip_hash": tip_hash,
+        "min_height": floor,
+    }
+    _log(f"  best chain: {len(_best_chain_cache['ids'])} blocks back from "
+         f"height {_best_chain_cache['tip_height']}")
+    return _best_chain_cache
 
 
 def _mature_height():
@@ -493,6 +580,7 @@ def getBlockStatusReport(creator, epoch):
     rows = _query_dict(
         """
         SELECT
+          b.id,
           b.height,
           b.state_hash,
           b.chain_status::text AS chain_status,
@@ -516,20 +604,33 @@ def getBlockStatusReport(creator, epoch):
 
     spb = _avg_seconds_per_block()
 
+    # Confirmations are counted as real descendants: a block only counts as
+    # confirmed if it is an ancestor of the current best tip. A block on a
+    # losing branch gets 0 immediately, without waiting for the archive to
+    # label it 'orphaned' at K=290.
+    heights = [int(r["height"]) for r in rows] or [chain_tip]
+    bc = _best_chain(min_height=min(heights) - 1)
+    on_chain = bc["ids"]
+    tip_h = bc["tip_height"] or chain_tip
+
     out = []
     for r in rows:
         h = int(r["height"])
         status = r["chain_status"]
-        confs = max(0, chain_tip - h)
-        to_go = max(0, h - mature_h)          # blocks left until payable
+        in_chain = int(r["id"]) in on_chain
+        confs = max(0, tip_h - h) if in_chain else 0
+        lost = (status == "orphaned") or not in_chain
+        to_go = 0 if lost else max(0, conf - confs)
         out.append({
             "height": h,
             "state_hash": r["state_hash"],
             "chain_status": status,
+            "on_best_chain": in_chain,
             "ts": int(r["ts"]),
             "coinbase_mina": int(r["coinbase"]) / NANOMINA,
             "confirmations": confs,
-            "mature": status != "orphaned" and confs >= conf,
+            "mature": (not lost) and confs >= conf,
+            "lost": lost,
             "blocks_to_mature": to_go,
             "eta_seconds": (to_go * spb) if (spb and to_go) else 0,
         })
@@ -558,6 +659,57 @@ def ensureStakingLedger(epoch, ledger_hash):
 def stakingLedgerPath(epoch, ledger_hash):
     """Local cache path for a staking ledger (may not exist yet)."""
     return _LEDGERS_CACHE / f"epoch-{int(epoch)}-{ledger_hash}.json"
+
+
+def getOrphanRate(creator=None):
+    """Share of produced blocks that ended up orphaned, from archive history.
+
+    Returns {"own": {...}, "network": {...}} where each side is
+    {won, lost, rate} or None when there is no usable data.
+
+    Eras with zero recorded orphans are skipped: that means the data came from
+    a Foundation SQL dump that only carried the canonical chain, not that the
+    network was perfect. Pre-Berkeley (era 1) is exactly such a case.
+
+    Why this matters: a VRF scan tells you how many slots you WIN, but a won
+    slot only pays if your block survives. At the ~38% orphan rate seen on
+    mainnet, the VRF figure is an upper bound, not an expectation.
+    """
+    def _rate(where, params):
+        rows = _query_dict(
+            f"""
+            SELECT b.protocol_version_id AS era,
+                   count(*) FILTER (WHERE b.chain_status = 'canonical') AS won,
+                   count(*) FILTER (WHERE b.chain_status = 'orphaned')  AS lost
+            FROM blocks b
+            {where}
+            GROUP BY b.protocol_version_id
+            """, params)
+        won = lost = 0
+        for r in rows:
+            # skip eras with no orphan records at all - dump artefact
+            if int(r["lost"]) == 0:
+                continue
+            won += int(r["won"])
+            lost += int(r["lost"])
+        total = won + lost
+        if total == 0:
+            return None
+        return {"won": won, "lost": lost, "rate": lost / total}
+
+    out = {"own": None, "network": None}
+    try:
+        out["network"] = _rate(
+            "WHERE b.chain_status IN ('canonical','orphaned')", {})
+        if creator:
+            out["own"] = _rate(
+                """JOIN public_keys pk ON pk.id = b.creator_id
+                   WHERE pk.value = %(creator)s
+                     AND b.chain_status IN ('canonical','orphaned')""",
+                {"creator": creator})
+    except Exception as e:
+        _log(f"  (could not compute orphan rate: {e})")
+    return out
 
 
 def getBaseCoinbase():
@@ -809,10 +961,14 @@ WITH our_blocks AS (
   JOIN public_keys pkc ON pkc.id = b.creator_id
   JOIN public_keys pkw ON pkw.id = b.block_winner_id
   WHERE pkc.value = %(creator)s
-    -- Not 'canonical' but "not known-orphaned": chain_status only flips to
-    -- canonical at K=290, while the payout gate is the depth-based
-    -- CONFIRMATIONS_NUM already applied to h_max by the caller.
+    -- Two independent safety gates:
+    --  * chain_status <> 'orphaned' catches what the archive already resolved
+    --  * b.id = ANY(chain_ids) catches losing branches long before that, by
+    --    requiring the block to be an ancestor of the current best tip.
+    -- The second one is what matters: chain_status stays 'pending' until K=290,
+    -- so without it a dead branch looks payable for ~17 hours.
     AND b.chain_status <> 'orphaned'
+    AND b.id = ANY(%(chain_ids)s)
     AND b.height BETWEEN %(h_min)s AND %(h_max)s
     AND b.protocol_version_id = %(pv_id)s
     AND (b.global_slot_since_hard_fork / %(spe)s) = %(epoch)s
@@ -871,6 +1027,7 @@ ORDER BY ob.height DESC;
     _log(f"  querying SQL for blocks: creator={creator[:10]}..., epoch={epoch}, "
          f"heights={h_min}..{h_max}")
     t0 = time.time()
+    chain_ids = sorted(_best_chain(min_height=h_min - 1)["ids"])
     rows = _query_dict(sql, {
         "creator": creator,
         "h_min": h_min,
@@ -878,6 +1035,7 @@ ORDER BY ob.height DESC;
         "spe": spe,
         "epoch": epoch,
         "pv_id": pv_id,
+        "chain_ids": chain_ids,
     })
     _log(f"  SQL returned {len(rows)} rows in {time.time()-t0:.2f}s")
 
