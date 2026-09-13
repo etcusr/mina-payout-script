@@ -255,6 +255,12 @@ overpaid 957.2650 | underpaid 0.1381
 Regenerating first matters: reconciling against a stale payout file carries the
 wrong numbers forward.
 
+Two things keep the correction from being applied twice. `calc_rewards.py` does
+not net carried balances off an epoch that was already paid — that file is the
+baseline `reconcile.py` measures against, so it stays gross. And `reconcile.py`
+refuses to commit an epoch that is already in the ledger history, unless you
+pass `--force`.
+
 ### Applying the carry
 
 The next `calc_rewards.py` run nets the balances off automatically before it

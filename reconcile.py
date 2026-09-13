@@ -65,6 +65,8 @@ def main():
     ap.add_argument("-e", "--epoch", type=int, required=True)
     ap.add_argument("--commit", action="store_true",
                     help="write the deltas into payout_ledger.json")
+    ap.add_argument("--force", action="store_true",
+                    help="commit again for an epoch already in the ledger history")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open("config.yml", encoding="utf8"))
@@ -106,6 +108,19 @@ def main():
         return
 
     data = ledger.load()
+
+    # Reconciling the same epoch twice would write its deltas into the ledger a
+    # second time, doubling the correction. The history is the record of what
+    # has already been accounted for.
+    prior = [h for h in data.get("history", []) if h.get("epoch") == args.epoch]
+    if prior and not args.force:
+        print(f"\nepoch {args.epoch} was already reconciled on {prior[-1]['at']}:")
+        print(f"  {prior[-1]['note']}")
+        print("nothing written - its deltas are already in the ledger.")
+        print("If the payout file has since changed and you really mean to apply")
+        print("the difference again, re-run with --force.")
+        return
+
     for a, d in deltas.items():
         # A positive delta means they hold our money, so their balance goes
         # negative and the next payout is reduced by that much.

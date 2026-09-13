@@ -614,10 +614,19 @@ for p in payouts:
 # share is combined with others going to the same destination.
 # Carried balances from previous epochs: an address that was overpaid gets
 # less now, one that was underpaid gets topped up. See ledger.py / reconcile.py.
+#
+# Not for an epoch that was already paid. Its payout file is the baseline
+# reconcile.py compares the sent transactions against, so it has to stay gross.
+# Netting an epoch's own correction off its own file would make reconcile.py
+# read a smaller "owed", compute a larger delta, and write the overpayment into
+# the ledger a second time.
+_epoch_already_paid = os.path.exists(f"sended_txs_e{staking_epoch}.csv")
+
 _carry_applied = []
 for dest, row in payout_rows.items():
     gross_mina = row["nano"] / decimal_
-    net_mina, carry = ledger.adjust(gross_mina, dest)
+    net_mina, carry = (gross_mina, 0.0) if _epoch_already_paid \
+        else ledger.adjust(gross_mina, dest)
     if abs(carry) >= 1e-6:
         _carry_applied.append((dest, gross_mina, carry, net_mina))
         row["nano"] = net_mina * decimal_
@@ -642,6 +651,10 @@ if _carry_applied:
     if still:
         print(f"  {C.GREY}{still} address(es) still in debt after this epoch - "
               f"the remainder carries on{C.RESET}")
+elif _epoch_already_paid and ledger.balances():
+    print(f"\n{C.GREY}Carried balances not applied: epoch {staking_epoch} was "
+          f"already paid, so this file stays gross as reconcile.py's baseline."
+          f"{C.RESET}")
 
 redirected = [(d, r) for d, r in payout_rows.items()
               if r["sources"] != [d]]
