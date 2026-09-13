@@ -1,6 +1,7 @@
 from tabulate import tabulate
 import GraphQL
 import redirects
+import ledger
 import os
 import sys
 import requests
@@ -344,7 +345,34 @@ if report:
 
     # --- Verdict ------------------------------------------------------------
     print(_hr())
-    if mature and payout_now:
+    # Has this epoch already been paid? send_payout.py appends every submitted
+    # transaction to sended_txs_e<N>.csv, so its presence means money went out.
+    _already = 0
+    _already_mina = 0.0
+    _sent_file = f"sended_txs_e{staking_epoch}.csv"
+    if os.path.exists(_sent_file):
+        import ast as _ast
+        for _line in open(_sent_file, encoding="utf-8"):
+            _line = _line.strip()
+            if not _line:
+                continue
+            try:
+                _t = _ast.literal_eval(_line)["sendPayment"]["payment"]
+                _already_mina += int(_t["amount"]) / 1e9
+                _already += 1
+            except Exception:
+                continue
+
+    if _already:
+        print(f"  {C.RED}{C.BOLD}ALREADY PAID{C.RESET} {C.RED}- {_already} "
+              f"transaction(s) worth {_already_mina:,.2f} MINA were already sent "
+              f"for this epoch{C.RESET}")
+        print(f"  {C.GREY}({_sent_file}){C.RESET}")
+        print(f"  {C.YELLOW}Running send_payout.py now would pay everyone a "
+              f"second time.{C.RESET}")
+        print(f"  {C.GREY}Reconcile first:{C.RESET} "
+              f"{C.BOLD}python3 reconcile.py --epoch {staking_epoch}{C.RESET}")
+    elif mature and payout_now:
         print(f"  {C.GREEN}{C.BOLD}READY{C.RESET} {C.GREEN}- epoch is settled, "
               f"safe to run:{C.RESET} "
               f"{C.BOLD}python3 send_payout.py --epoch {staking_epoch}{C.RESET}")
@@ -522,6 +550,15 @@ if PAYOUT_REDIRECTS:
         print(f"  {C.GREY if not line.startswith(' ') else C.CYAN}{line}{C.RESET}")
     print()
 
+# Start the payout file from scratch. It is written in append mode below, so
+# without this a re-run would stack a second full set of payouts on top of the
+# first - and send_payout.py would pay everyone twice.
+_payout_file = f'e{staking_epoch}_payouts.csv'
+try:
+    os.remove(_payout_file)
+except FileNotFoundError:
+    pass
+
 # destination address -> merged payout
 payout_rows = {}
 
@@ -575,7 +612,15 @@ for p in payouts:
 # The minimum is applied to the FINAL transfer, after redirects are merged:
 # a delegator below the threshold on their own may still clear it once their
 # share is combined with others going to the same destination.
+# Carried balances from previous epochs: an address that was overpaid gets
+# less now, one that was underpaid gets topped up. See ledger.py / reconcile.py.
+_carry_applied = []
 for dest, row in payout_rows.items():
+    gross_mina = row["nano"] / decimal_
+    net_mina, carry = ledger.adjust(gross_mina, dest)
+    if abs(carry) >= 1e-6:
+        _carry_applied.append((dest, gross_mina, carry, net_mina))
+        row["nano"] = net_mina * decimal_
     if row["nano"] / decimal_ < MINIMUM_PAYOUT:
         continue
     payout_string = f'{dest};' \
@@ -585,6 +630,18 @@ for dest, row in payout_rows.items():
                     f'{row["timed_weighting"]}'
     write_to_file(data_string=payout_string,
                   file_name=f'e{staking_epoch}_payouts.csv', mode='a')
+
+if _carry_applied:
+    print(f"\n{C.BOLD}Carried balances applied to {len(_carry_applied)} "
+          f"address(es){C.RESET}")
+    print(f"  {'address':<56}{'this epoch':>12}{'carry':>12}{'to pay':>12}")
+    for a, g, cr, net in sorted(_carry_applied, key=lambda x: x[2]):
+        col = C.RED if cr < 0 else C.GREEN
+        print(f"  {C.GREY}{a}{C.RESET}{g:>12.4f}{col}{cr:>+12.4f}{C.RESET}{net:>12.4f}")
+    still = sum(1 for _, _, cr, net in _carry_applied if net <= 0)
+    if still:
+        print(f"  {C.GREY}{still} address(es) still in debt after this epoch - "
+              f"the remainder carries on{C.RESET}")
 
 redirected = [(d, r) for d, r in payout_rows.items()
               if r["sources"] != [d]]

@@ -24,6 +24,7 @@ coinbase, reset epoch numbering.
   - [2. Read the report](#2-read-the-report)
   - [3. Send payouts](#3-send-payouts)
   - [4. Withdraw commission](#4-withdraw-commission)
+- [Ledger and reconciliation](#ledger-and-reconciliation)
 - [Payout redirects](#payout-redirects)
 - [VRF slot prediction](#vrf-slot-prediction)
 - [Running an archive node](#running-an-archive-node)
@@ -183,6 +184,24 @@ Reads `e3_payouts.csv`, unlocks the wallet, sends one transaction per line, then
 watches until each is included. Anything unconfirmed within
 `TX_CHECK_TIMER_SECONDS` is written to `failed_payouts_3.csv` so you can retry.
 
+Before sending anything it runs pre-flight checks and aborts on any of them:
+
+| Check | Why |
+| --- | --- |
+| Duplicate addresses in the CSV | The file was appended to across runs; sending it pays people twice |
+| Total against the live wallet balance | A short balance stops the run partway and leaves the epoch half paid |
+| `sended_txs_e<N>.csv` already exists | This epoch was already paid — see [Ledger and reconciliation](#ledger-and-reconciliation) |
+
+```bash
+python3 send_payout.py --epoch 3 --dry-run   # run the checks, send nothing
+python3 send_payout.py --epoch 3 --resume    # finish an interrupted round
+python3 send_payout.py --epoch 3 --yes       # skip the confirmation prompt
+```
+
+`--resume` skips every address already present in `sended_txs_e<N>.csv`, so an
+interrupted run continues rather than starting over. The wallet is relocked in
+a `finally` block, so it stays locked even if a send raises.
+
 ### 4. Withdraw commission
 
 ```bash
@@ -193,6 +212,62 @@ python3 withdraw.py --amount 252.5 --to B62qOther...   # override destination
 The amount is deliberately manual: the wallet balance does not account for
 payouts still sitting in the mempool, so an automatic "everything minus a
 buffer" can easily send money you have already promised to delegators.
+
+## Ledger and reconciliation
+
+Payouts do not always land on exactly the computed amount. A run can be
+interrupted, a transaction can fail, an epoch can be recalculated after more
+blocks matured, or a bad payout file can send people several times what they
+were owed.
+
+Rather than chasing each case by hand, the difference is carried into the next
+epoch. `payout_ledger.json` holds one balance per address:
+
+| Balance | Meaning |
+| --- | --- |
+| negative | The address received too much; its next payout is reduced by that amount |
+| positive | The address was underpaid; the shortfall is added to its next payout |
+
+If the debt exceeds the new payout, the address receives nothing and the
+remainder carries forward again. No manual intervention — it clears itself over
+one or two epochs.
+
+### Reconciling a round
+
+After a payout round, regenerate the payout file so it reflects the final block
+count, then compare it against what was actually submitted:
+
+```bash
+python3 calc_rewards.py --epoch 0        # refresh e0_payouts.csv
+python3 reconcile.py --epoch 0           # show sent vs owed per address
+python3 reconcile.py --epoch 0 --commit  # store the deltas in payout_ledger.json
+```
+
+```
+address                                                        sent       owed      delta
+B62qDelegatorOne...                                       715.1038   357.5519  +357.5519
+B62qDelegatorTwo...                                       661.8925   330.9463  +330.9463
+
+sent 3,969.7965 | owed 3,012.6696
+overpaid 957.2650 | underpaid 0.1381
+```
+
+Regenerating first matters: reconciling against a stale payout file carries the
+wrong numbers forward.
+
+### Applying the carry
+
+The next `calc_rewards.py` run nets the balances off automatically before it
+writes the CSV:
+
+```
+Carried balances applied to 25 address(es)
+  address                                    this epoch       carry      to pay
+  B62qDelegatorOne...                          412.3311   -357.5519     54.7792
+```
+
+The file is plain JSON, so a balance can be inspected, adjusted or dropped by
+hand if you settle with someone off-chain. It is in `.gitignore`.
 
 ## Payout redirects
 

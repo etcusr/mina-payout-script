@@ -16,6 +16,9 @@ logs/
 vrf/*.json
 failed_withdraw.csv
 
+# carry-forward balances per delegator address
+payout_ledger.json
+
 # --- caches: huge and re-downloadable --------------------------------------
 archive/cache/
 archive/pgdata/
