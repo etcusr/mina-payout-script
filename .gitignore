@@ -16,8 +16,11 @@ logs/
 vrf/*.json
 failed_withdraw.csv
 
-# carry-forward balances per delegator address
+# Carry-forward ledger: local bookkeeping, not part of the published tool.
+# calc_rewards.py and send_payout.py work with or without these.
 payout_ledger.json
+ledger.py
+reconcile.py
 
 # --- caches: huge and re-downloadable --------------------------------------
 archive/cache/

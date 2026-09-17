@@ -129,9 +129,11 @@ if os.path.exists(SENT_FILE):
         except Exception:
             continue
     if not args.resume:
+        _settle = (f'  To settle the difference:  python3 reconcile.py --epoch {EPOCH}\n'
+                   if os.path.exists('reconcile.py') else '')
         die(f'{SENT_FILE} already holds {n_sent} transaction(s) for epoch {EPOCH}.\n'
             f'  Sending again would pay everyone a second time.\n'
-            f'  To settle the difference:  python3 reconcile.py --epoch {EPOCH}\n'
+            f'{_settle}'
             f'  To finish an interrupted run:  python3 send_payout.py --epoch {EPOCH} --resume')
     skipped = [r for r in rows if r["to"] in already_sent]
     rows = [r for r in rows if r["to"] not in already_sent]

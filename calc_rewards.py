@@ -1,7 +1,6 @@
 from tabulate import tabulate
 import GraphQL
 import redirects
-import ledger
 import os
 import sys
 import requests
@@ -11,6 +10,14 @@ import time
 import yaml
 from pprint import pprint
 import argparse
+
+# Optional carry-forward ledger. When ledger.py is present, amounts owed to an
+# address from earlier epochs are netted off what it gets now; without it the
+# payout file is simply this epoch's amounts. Nothing else changes.
+try:
+    import ledger
+except ImportError:
+    ledger = None
 
 
 class C:
@@ -370,8 +377,9 @@ if report:
         print(f"  {C.GREY}({_sent_file}){C.RESET}")
         print(f"  {C.YELLOW}Running send_payout.py now would pay everyone a "
               f"second time.{C.RESET}")
-        print(f"  {C.GREY}Reconcile first:{C.RESET} "
-              f"{C.BOLD}python3 reconcile.py --epoch {staking_epoch}{C.RESET}")
+        if ledger:
+            print(f"  {C.GREY}Reconcile first:{C.RESET} "
+                  f"{C.BOLD}python3 reconcile.py --epoch {staking_epoch}{C.RESET}")
     elif mature and payout_now:
         print(f"  {C.GREEN}{C.BOLD}READY{C.RESET} {C.GREEN}- epoch is settled, "
               f"safe to run:{C.RESET} "
@@ -554,10 +562,17 @@ if PAYOUT_REDIRECTS:
 # without this a re-run would stack a second full set of payouts on top of the
 # first - and send_payout.py would pay everyone twice.
 _payout_file = f'e{staking_epoch}_payouts.csv'
-try:
-    os.remove(_payout_file)
-except FileNotFoundError:
-    pass
+# Same for the gross file. It records what the epoch owed before carried
+# balances were netted off, and reconcile.py measures the sent transactions
+# against it - see the comment at the carry loop below.
+_owed_file = f'e{staking_epoch}_owed.csv' if ledger else None
+for _f in (_payout_file, _owed_file):
+    if not _f:
+        continue
+    try:
+        os.remove(_f)
+    except FileNotFoundError:
+        pass
 
 # destination address -> merged payout
 payout_rows = {}
@@ -615,17 +630,36 @@ for p in payouts:
 # Carried balances from previous epochs: an address that was overpaid gets
 # less now, one that was underpaid gets topped up. See ledger.py / reconcile.py.
 #
-# Not for an epoch that was already paid. Its payout file is the baseline
-# reconcile.py compares the sent transactions against, so it has to stay gross.
-# Netting an epoch's own correction off its own file would make reconcile.py
-# read a smaller "owed", compute a larger delta, and write the overpayment into
-# the ledger a second time.
+# Two files come out of this loop, and the difference between them is what makes
+# a carried balance actually clear:
+#
+#   e<N>_owed.csv     GROSS - what the epoch owed each address, before carry
+#   e<N>_payouts.csv  NET   - what send_payout.py should send, after carry
+#
+# reconcile.py measures the sent transactions against the GROSS file and stores
+# `owed - sent`. So an address that forwent 39 MINA this epoch has its debt
+# reduced by exactly 39. Measuring against the NET file instead would give
+# `net - sent = 0`, the balance would never move, and the same debt would be
+# deducted again every epoch, forever.
+#
+# The gross file holds every destination, including those below MINIMUM_PAYOUT.
+# The minimum decides what is worth a transaction, not what is owed: amounts too
+# small to send accumulate in the ledger until they clear the threshold.
 _epoch_already_paid = os.path.exists(f"sended_txs_e{staking_epoch}.csv")
 
 _carry_applied = []
 for dest, row in payout_rows.items():
     gross_mina = row["nano"] / decimal_
-    net_mina, carry = (gross_mina, 0.0) if _epoch_already_paid \
+
+    if _owed_file:
+        write_to_file(data_string=f'{dest};'
+                                  f'{float_to_string(int(row["nano"]))};'
+                                  f'{float_to_string(gross_mina)};'
+                                  f'{row["delegation_type"]};'
+                                  f'{row["timed_weighting"]}',
+                      file_name=_owed_file, mode='a')
+
+    net_mina, carry = (gross_mina, 0.0) if (_epoch_already_paid or not ledger) \
         else ledger.adjust(gross_mina, dest)
     if abs(carry) >= 1e-6:
         _carry_applied.append((dest, gross_mina, carry, net_mina))
@@ -638,7 +672,7 @@ for dest, row in payout_rows.items():
                     f'{row["delegation_type"]};' \
                     f'{row["timed_weighting"]}'
     write_to_file(data_string=payout_string,
-                  file_name=f'e{staking_epoch}_payouts.csv', mode='a')
+                  file_name=_payout_file, mode='a')
 
 if _carry_applied:
     print(f"\n{C.BOLD}Carried balances applied to {len(_carry_applied)} "
@@ -651,7 +685,7 @@ if _carry_applied:
     if still:
         print(f"  {C.GREY}{still} address(es) still in debt after this epoch - "
               f"the remainder carries on{C.RESET}")
-elif _epoch_already_paid and ledger.balances():
+elif ledger and _epoch_already_paid and ledger.balances():
     print(f"\n{C.GREY}Carried balances not applied: epoch {staking_epoch} was "
           f"already paid, so this file stays gross as reconcile.py's baseline."
           f"{C.RESET}")
