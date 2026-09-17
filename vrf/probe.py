@@ -259,7 +259,28 @@ def scan_range(lo, hi, ctx, delegators, workers=8, batch=20, password=None,
     if verbose:
         print("producer key unlocked\n")
 
+    # Progress goes through tqdm, on stderr, same as the staking-ledger download
+    # in GraphQL.py. The bar is drawn before the first chunk comes back, which
+    # matters here: with 8 workers in flight the first result is ~15s away and a
+    # bare screen for that long looks like a hang.
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        tqdm = None
+
     winners, done, t0 = [], 0, time.time()
+    bar = tqdm(total=len(chunks), unit="req", desc="  vrf", ncols=100,
+               bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
+                          "[{elapsed}<{remaining}{postfix}]",
+               postfix="starting") if (verbose and tqdm) else None
+
+    def _say(msg):
+        """Print without tearing the progress bar."""
+        if bar is not None:
+            bar.write(msg)
+        else:
+            print(msg, flush=True)
+
     try:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(scan_chunk, ch, delegators, seed, total_stake): ch
@@ -270,24 +291,32 @@ def scan_range(lo, hi, ctx, delegators, workers=8, batch=20, password=None,
                     found = fut.result()
                 except Exception as e:
                     with _print_lock:
-                        print(f"\n  chunk {ch[0]}..{ch[-1]} FAILED: {e}", flush=True)
+                        _say(f"  chunk {ch[0]}..{ch[-1]} FAILED: {e}")
                     continue
                 done += 1
                 winners.extend(found)
-                if verbose:
-                    with _print_lock:
+                with _print_lock:
+                    if verbose:
                         for slot, idx, pk, bal in sorted(found):
-                            print(f"\r  >>> WON slot {slot:>6}  idx {idx} "
-                                  f"({bal:,.2f} MINA)  {pk}", flush=True)
-                        el = time.time() - t0
-                        rate = done / el if el else 0
+                            _say(f"  >>> WON slot {slot:>6}  idx {idx} "
+                                 f"({bal:,.2f} MINA)  {pk}")
+                    el = time.time() - t0
+                    rate = done / el if el else 0
+                    if bar is not None:
+                        bar.set_postfix_str(
+                            f"{rate*batch*len(delegators):,.0f} evals/s, "
+                            f"{len(winners)} won", refresh=False)
+                        bar.update(1)
+                    elif verbose:
                         eta = (len(chunks) - done) / rate if rate else 0
                         print(f"  [{100*done/len(chunks):5.1f}%] {done}/{len(chunks)} "
                               f"requests, {el:.0f}s elapsed, ~{eta:.0f}s left, "
                               f"{rate*batch*len(delegators):,.0f} evals/s",
                               end="\r", flush=True)
     finally:
-        if verbose:
+        if bar is not None:
+            bar.close()
+        elif verbose:
             print()
         ensure_locked()
 
