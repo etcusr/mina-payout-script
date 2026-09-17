@@ -930,6 +930,93 @@ def _probe_schema():
     return _schema_probe
 
 
+def _decode_memo(memo):
+    """Mina memos are stored base58check-encoded. Return the readable string.
+
+    Layout after decoding: [version 0x14][tag][length][payload ... padding].
+    Tag 1 is a byte string, which is what the CLI and this project write.
+    Anything that does not decode cleanly comes back as-is, so a caller can
+    still see what is in the column.
+    """
+    A = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    try:
+        n = 0
+        for ch in memo:
+            n = n * 58 + A.index(ch)
+        raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        raw = b"\x00" * (len(memo) - len(memo.lstrip("1"))) + raw
+        body = raw[:-4]                       # drop the checksum
+        if len(body) < 3 or body[1] != 1:
+            return memo
+        return body[3:3 + body[2]].decode("utf-8", "replace")
+    except Exception:
+        return memo
+
+
+def getSentPayments(from_pk, memo_prefix=None, min_height=None, epoch=None):
+    """Payments actually sent from `from_pk`, read from the archive.
+
+    This is the chain's own record, so it counts what was included in a block -
+    not what a script believed it submitted. Transactions that were signed but
+    never made it in simply do not appear, and anything sent by hand from a
+    wallet does.
+
+    Only blocks on the current best chain are considered, so an orphaned block's
+    payments do not count. Pass `memo_prefix` to keep only the payments whose
+    decoded memo starts with it; send_payout.py writes 'e<N>-f1_<validator>',
+    which makes the memo an epoch tag.
+
+    Returns [{to, amount_mina, height, memo, hash}], newest block first.
+    """
+    # Payouts for an epoch are sent once it has ended, so they land in blocks at
+    # or above its first one. Giving the chain walk that floor keeps it from
+    # crawling back to genesis - without it the recursive query is the slowest
+    # thing in the script by a wide margin.
+    if min_height is None and epoch is not None:
+        h_min, _ = getEpochBlockRange(epoch)
+        if h_min:
+            min_height = h_min
+
+    probe = _probe_schema()
+    chain_ids = sorted(_best_chain(min_height=min_height)["ids"])
+
+    status_ok = ""
+    if probe["buc_has_status"]:
+        status_ok = "AND buc.status = 'applied'"
+
+    rows = _query_dict(f"""
+        SELECT pk_to.value          AS to_pk,
+               uc.amount            AS amount,
+               uc.memo              AS memo,
+               uc.hash              AS hash,
+               b.height             AS height
+        FROM blocks_user_commands buc
+        JOIN user_commands uc  ON uc.id = buc.user_command_id
+        JOIN blocks b          ON b.id  = buc.block_id
+        JOIN public_keys pk_from ON pk_from.id = uc.source_id
+        JOIN public_keys pk_to   ON pk_to.id   = uc.receiver_id
+        WHERE pk_from.value = %(from_pk)s
+          AND uc.{probe["uc_type_col"]} = 'payment'
+          AND b.id = ANY(%(chain_ids)s)
+          {status_ok}
+        ORDER BY b.height DESC
+        """, {"from_pk": from_pk, "chain_ids": chain_ids})
+
+    out = []
+    for r in rows:
+        memo = _decode_memo(r["memo"] or "")
+        if memo_prefix and not memo.startswith(memo_prefix):
+            continue
+        out.append({
+            "to": r["to_pk"],
+            "amount_mina": int(r["amount"]) / NANOMINA,
+            "height": r["height"],
+            "memo": memo,
+            "hash": r["hash"],
+        })
+    return out
+
+
 def getBlocks(variables):
     """
     Return canonical blocks created by `creator` in the requested epoch and
