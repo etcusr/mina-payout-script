@@ -22,6 +22,9 @@ payout_ledger.json
 ledger.py
 reconcile.py
 
+# Working notes for Claude Code: describes the local ledger machinery above
+CLAUDE.md
+
 # --- caches: huge and re-downloadable --------------------------------------
 archive/cache/
 archive/pgdata/

@@ -43,6 +43,15 @@ CONFIRMATIONS_NUM: 20
 # Rewards below this many MINA are skipped (not worth the tx fee).
 MINIMUM_PAYOUT: 0.1
 
+# Own addresses that stake here but should not be sent a payout. The coinbase
+# already sits on the payout wallet, so paying it to itself moves nothing and
+# costs a transaction fee; their share simply stays where it is.
+# Defaults to SEND_FROM_ADDRESS and VALIDATOR_ADDRESS when this key is absent.
+# Set to [] to pay them like any other delegator.
+EXCLUDE_FROM_PAYOUTS:
+  - B62qYourPayoutWallet...
+  - B62qYourBlockProducer...
+
 # Slots per epoch. Mesa kept 7140, but slot time dropped from 180s to 90s,
 # so an epoch is now ~7.44 days instead of ~14.9.
 SLOTS_PER_EPOCH: 7140

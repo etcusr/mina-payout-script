@@ -21,28 +21,52 @@ done
 export MINA_PAYOUT_DIR="$(cd -P "$(dirname "$_mina_src")/.." && pwd)"
 unset _mina_src _mina_dir
 
+# These are functions, not aliases, on purpose. A payout round is several
+# commands against the same working directory, and the scripts read and write
+# files relative to it. A command that runs the project in a subshell would
+# leave you wherever you started, so the next one fails or - worse - reads a
+# different directory's files. Each command below lands you in the project with
+# the venv active, so whatever you run next just works.
+
+# Enter the project and activate the venv. Every command below starts with this.
+mina_cd() {
+    [ -d "$MINA_PAYOUT_DIR" ] || {
+        echo "MINA_PAYOUT_DIR is not set or missing: ${MINA_PAYOUT_DIR:-unset}" >&2
+        return 1
+    }
+    cd "$MINA_PAYOUT_DIR" || return 1
+    if [ -z "${VIRTUAL_ENV:-}" ] && [ -f venv/bin/activate ]; then
+        . venv/bin/activate
+    fi
+}
+
 # Calculate rewards. Takes an optional epoch, then any calc_rewards.py flag.
 #   mina_calc              current epoch
 #   mina_calc 3            epoch 3
 #   mina_calc 3 --vrf      epoch 3 + VRF slot scan
-alias mina_calc="\"\$MINA_PAYOUT_DIR/calc.sh\""
+mina_calc() { mina_cd && ./calc.sh "$@"; }
 
 # Send the payouts for an epoch (asks for the wallet password).
 #   mina_pay --epoch 3
-alias mina_pay="cd \"\$MINA_PAYOUT_DIR\" && source venv/bin/activate && python3 send_payout.py"
+mina_pay() { mina_cd && python3 send_payout.py "$@"; }
+
+# Compare an epoch against what reached the chain, and carry the difference.
+#   mina_reconcile --epoch 3 --commit
+mina_reconcile() {
+    mina_cd || return 1
+    [ -f reconcile.py ] || { echo "reconcile.py is not installed here" >&2; return 1; }
+    python3 reconcile.py "$@"
+}
 
 # Withdraw commission to the cold wallet.
 #   mina_withdraw --amount 252.5
-alias mina_withdraw="cd \"\$MINA_PAYOUT_DIR\" && source venv/bin/activate && python3 withdraw.py"
+mina_withdraw() { mina_cd && python3 withdraw.py "$@"; }
 
 # Predict which slots this validator wins in an epoch.
 #   mina_vrf --epoch 3
-alias mina_vrf="cd \"\$MINA_PAYOUT_DIR\" && source venv/bin/activate && python3 vrf/probe.py"
+mina_vrf() { mina_cd && python3 vrf/probe.py "$@"; }
 
 # SSH tunnel to the node: GraphQL 3085 + Postgres 5432.
 #   mina_tunnel my-node --bg
 #   mina_tunnel --stop
-alias mina_tunnel="\"\$MINA_PAYOUT_DIR/scripts/tunnel.sh\""
-
-# Jump into the project with the venv active.
-alias mina_cd="cd \"\$MINA_PAYOUT_DIR\" && source venv/bin/activate"
+mina_tunnel() { "$MINA_PAYOUT_DIR/scripts/tunnel.sh" "$@"; }

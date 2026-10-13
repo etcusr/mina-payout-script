@@ -60,6 +60,17 @@ confirmations  = int(c["CONFIRMATIONS_NUM"])  # Can set this to any value for mi
 MINIMUM_PAYOUT = float(c["MINIMUM_PAYOUT"])
 # Wallet the coinbase lands on and payouts are sent from (--coinbase-receiver)
 payout_wallet  = str(c["SEND_FROM_ADDRESS"])
+
+# Addresses that stake but should not receive a payout transaction. The coinbase
+# already lands on the payout wallet, so sending it to itself moves nothing and
+# costs a fee; the same goes for any other address of yours that stakes here.
+# Their share simply stays where it is. Defaults to the payout wallet and the
+# block producer key; set EXCLUDE_FROM_PAYOUTS: [] in config.yml to pay them.
+EXCLUDE_FROM_PAYOUTS = {
+    str(a) for a in c.get("EXCLUDE_FROM_PAYOUTS",
+                          [payout_wallet, str(c["VALIDATOR_ADDRESS"])])
+    if str(a).strip()
+}
 decimal_       = 1e9
 # Base coinbase is read from the archive rather than hardcoded: Mesa (MIP6)
 # halved it 720 -> 360 because slots went from 180s to 90s. It is only used as
@@ -646,6 +657,54 @@ for p in payouts:
 # The minimum decides what is worth a transaction, not what is owed: amounts too
 # small to send accumulate in the ledger until they clear the threshold.
 _epoch_already_paid = os.path.exists(f"sended_txs_e{staking_epoch}.csv")
+
+# A carried balance is only cleared by reconcile.py, after the payout it
+# adjusted has actually been sent. So building a second epoch's payout file
+# while an earlier one is still unreconciled deducts the same debt twice - once
+# per file - and every later check passes: neither file has duplicate rows, the
+# wallet covers either one, and no transactions have been sent. The delegators
+# are simply underpaid, silently, by the amount of the debt per extra file.
+if ledger and not _epoch_already_paid:
+    import glob as _glob
+    import re as _re
+    _done = {h.get("epoch") for h in ledger.load().get("history", [])}
+    _pending = sorted(
+        e for e in (
+            int(m.group(1))
+            for m in (_re.match(r"e(\d+)_payouts\.csv$", os.path.basename(f))
+                      for f in _glob.glob("e*_payouts.csv"))
+            if m)
+        if e < staking_epoch and e not in _done)
+    if _pending:
+        print(f"\n{C.RED}{C.BOLD}REFUSING to apply carried balances{C.RESET}")
+        print(f"  {C.RED}Epoch(s) {', '.join(map(str, _pending))} have a payout "
+              f"file but were never reconciled.{C.RESET}")
+        print(f"  {C.GREY}Their carry has not been cleared yet, so applying it "
+              f"here would deduct the same\n  debt a second time and underpay "
+              f"everyone.{C.RESET}\n")
+        print(f"  Finish the earlier epoch first:")
+        for e in _pending:
+            print(f"    {C.BOLD}python3 send_payout.py --epoch {e}{C.RESET}"
+                  f"{C.GREY}   (then){C.RESET}")
+            print(f"    {C.BOLD}python3 reconcile.py --epoch {e} --commit{C.RESET}")
+        print(f"\n  {C.GREY}Pay epochs in order, one at a time.{C.RESET}")
+        sys.exit(1)
+
+# Own addresses leave the payout set entirely - no transaction, and no entry in
+# the gross file either, since there is no obligation to yourself for the ledger
+# to carry. Done after redirects, so the test is against the address that would
+# actually receive the money.
+_excluded = {d: r["nano"] / decimal_
+             for d, r in payout_rows.items() if d in EXCLUDE_FROM_PAYOUTS}
+for d in _excluded:
+    del payout_rows[d]
+if _excluded:
+    print(f"\n{C.BOLD}Excluded from payouts: {len(_excluded)} own address(es)"
+          f"{C.RESET}")
+    for d, amount in sorted(_excluded.items(), key=lambda x: -x[1]):
+        print(f"  {C.GREY}{d}{C.RESET}{amount:>12.4f}")
+    print(f"  {C.GREY}{sum(_excluded.values()):,.4f} MINA stays on the payout "
+          f"wallet (EXCLUDE_FROM_PAYOUTS){C.RESET}")
 
 _carry_applied = []
 for dest, row in payout_rows.items():
