@@ -240,6 +240,8 @@ try:
 except ImportError:
     tqdm = None
 
+wait_started = time.time()
+first_included = None
 deadline = time.time() + TX_CHECK_TIMER
 bar = tqdm(total=len(TX_LIST_TO_CHECK), unit="tx", desc="  included", ncols=100,
            bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
@@ -270,6 +272,8 @@ while TX_LIST_TO_CHECK and time.time() < deadline:
 
         if "INCLUDED" in tx_data or "included" in tx_data:
             TX_LIST_TO_CHECK.remove(tx)
+            if first_included is None:
+                first_included = time.time()
             if bar:
                 bar.update(1)
 
@@ -281,8 +285,19 @@ while TX_LIST_TO_CHECK and time.time() < deadline:
 if bar:
     bar.close()
 
+def _hms(seconds):
+    m, s = divmod(int(seconds), 60)
+    return f'{m}m{s:02d}s' if m else f'{s}s'
+
+
 if not TX_LIST_TO_CHECK:
-    print(f'\nAll {len(rows)} payment(s) confirmed.')
+    total = time.time() - wait_started
+    print(f'\nAll {len(rows)} payment(s) confirmed in {_hms(total)}.')
+    if first_included:
+        # The gap between the two is how long the batch took to drain once
+        # blocks started coming; the first figure is just waiting for a block.
+        print(f'  first included after {_hms(first_included - wait_started)}, '
+              f'the rest within {_hms(time.time() - first_included)}')
     if os.path.exists('reconcile.py'):
         print(f'Next: python3 reconcile.py --epoch {EPOCH} --commit')
     sys.exit(0)
