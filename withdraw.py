@@ -1,6 +1,6 @@
 import argparse
 import getpass
-import pprint
+import sys
 from mina_client import MinaClient
 import time
 import yaml
@@ -46,8 +46,6 @@ WALLET_PASSWORD   = getpass.getpass(f'Wallet password for {send_from}: ')
 
 graphql = MinaClient(graphql_host=GRAPHQL_HOST, graphql_port=GRAPHQL_PORT)
 
-print(graphql.get_wallets())
-
 # Show the current balance for reference only - do NOT rely on it, there may
 # be pending payouts that are not reflected yet
 try:
@@ -89,67 +87,93 @@ hash_result = send_transaction(
         amount_nanomina=amount_nanomina,
     )
 TX_LIST_TO_CHECK.append(hash_result)
-print(hash_result)
+payment = hash_result["sendPayment"]["payment"]
+print(f'Submitted, nonce {payment["nonce"]}: '
+      f'https://minascan.io/mainnet/tx/{payment["id"]}')
 
 
-print(f'Trying to lock wallet: {send_from}')
 try:
     graphql.lock_wallet(send_from)
-except:
-    print("Can't lock wallet")
+except Exception as err:
+    print(f"Can't lock wallet: {err}")
 
-pool = graphql.get_pooled_payments(send_from)
-print(len(pool["pooledUserCommands"]))
-print(pool["pooledUserCommands"])
+# Wait for inclusion in a block. Same loop as send_payout.py: a progress bar
+# instead of a status line every second.
+print(f'\nWaiting for the withdrawal to be included '
+      f'(up to {TX_CHECK_TIMER / 60:.0f} min)')
 
-# Let's check all transactions status
-print(f'Starting verification of sent transactions. Checker timer = {TX_CHECK_TIMER / 60} min')
-while len(TX_LIST_TO_CHECK):
-    tx_data = ""
-    print(f'{len(TX_LIST_TO_CHECK)} pending txs in the pool. Timer timeout = {TX_CHECK_TIMER} sec')
-    for n, tx in enumerate(TX_LIST_TO_CHECK, start=1):
-        t1 = time.time()
-        tx_hash = tx["sendPayment"]["payment"]["id"]
-        try:
-            tx_data = graphql.get_transaction_status(tx_hash)
-        except Exception as tx_status_err:
-            print(f'Can\'t get TX status: {tx_status_err}')
-            TX_CHECK_TIMER -= time.time() - t1
-            continue
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
-        if "error" in str(tx_data):
-            print(f'Can\'t get TX status {tx_data}')
-            TX_CHECK_TIMER -= time.time() - t1
-            continue
+wait_started = time.time()
+deadline = time.time() + TX_CHECK_TIMER
+bar = tqdm(total=len(TX_LIST_TO_CHECK), unit="tx", desc="  included", ncols=100,
+           bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
+                      "[{elapsed}<{remaining}{postfix}]") if tqdm else None
 
-        elif "pending" in str(tx_data) or "PENDING" in str(tx_data):
-            print(f'Tx has pending status: https://minaexplorer.com/payment/{tx_hash}')
 
-        elif "INCLUDED" in str(tx_data) or "included" in str(tx_data):
-            print(f'Transaction sent successfully: https://minaexplorer.com/payment/{tx_hash}')
-            TX_LIST_TO_CHECK.remove(tx)
+def _say(msg):
+    bar.write(msg) if bar else print(msg, flush=True)
 
-        else:
-            print(f'Else triggered: {tx_data}')
 
-        time.sleep(1)
+def _hms(seconds):
+    m, s = divmod(int(seconds), 60)
+    return f'{m}m{s:02d}s' if m else f'{s}s'
 
-        TX_CHECK_TIMER -= time.time() - t1
-        if TX_CHECK_TIMER <= 0:
-            print(f'Timeout: Transaction verification took too long. Save failed transactions and exit\n'
-                  f'Unconfirmed transactions: {len(TX_LIST_TO_CHECK)}')
-            for tx_ in TX_LIST_TO_CHECK:
-                tx_ = tx_["sendPayment"]["payment"]
-                to_addr = tx_["to"]
-                amount_wei = tx_["amount"]
-                amount_in_mina = int(amount_wei) / 1e9
-                FAILED_PAYOUTS_LST.append(f'{to_addr};{str(amount_wei)};{str(amount_in_mina)};;')
-            with open(FAILED_PAYOUTS_FILE, "w") as failed_f:
-                for t in FAILED_PAYOUTS_LST:
-                    failed_f.write(f'{t}\n')
-            print(f'Check file with failed txs - {FAILED_PAYOUTS_FILE}')
-            exit(1)
 
-        if len(TX_LIST_TO_CHECK) == 0:
-            print("All transactions are successfully confirmed!")
-            exit(0)
+errors = 0
+try:
+    while TX_LIST_TO_CHECK and time.time() < deadline:
+        for tx in list(TX_LIST_TO_CHECK):
+            tx_hash = tx["sendPayment"]["payment"]["id"]
+            try:
+                tx_data = str(graphql.get_transaction_status(tx_hash))
+            except Exception as tx_status_err:
+                errors += 1
+                if errors in (1, 10, 100):      # don't paper the screen with these
+                    _say(f"  can't read the tx status ({tx_status_err}), still trying")
+                continue
+
+            if "error" in tx_data:
+                errors += 1
+                continue
+
+            if "INCLUDED" in tx_data or "included" in tx_data:
+                TX_LIST_TO_CHECK.remove(tx)
+                if bar:
+                    bar.update(1)
+
+        if TX_LIST_TO_CHECK:
+            if bar:
+                bar.set_postfix_str("pending", refresh=True)
+            time.sleep(5)
+except KeyboardInterrupt:
+    # The payment is already in the mempool; stopping the wait does not cancel it.
+    if bar:
+        bar.close()
+    print('\nStopped waiting. The withdrawal was already submitted and will '
+          'still be included - do not resend it.')
+    sys.exit(130)
+
+if bar:
+    bar.close()
+
+if not TX_LIST_TO_CHECK:
+    print(f'\nWithdrawal included in {_hms(time.time() - wait_started)}.')
+    sys.exit(0)
+
+# Timed out. It may yet land, so it is recorded rather than assumed lost.
+print('\nTimed out with the withdrawal not yet included.')
+for tx_ in TX_LIST_TO_CHECK:
+    tx_ = tx_["sendPayment"]["payment"]
+    amount_wei = tx_["amount"]
+    FAILED_PAYOUTS_LST.append(
+        f'{tx_["to"]};{amount_wei};{int(amount_wei) / 1e9};;')
+with open(FAILED_PAYOUTS_FILE, "w") as failed_f:
+    for t in FAILED_PAYOUTS_LST:
+        failed_f.write(f'{t}\n')
+print(f'Written to {FAILED_PAYOUTS_FILE}. It may still be included - check the '
+      f'explorer before resending.')
+sys.exit(1)
