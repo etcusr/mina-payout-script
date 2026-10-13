@@ -223,52 +223,83 @@ finally:
     except Exception as err:
         print(f"Can't lock wallet: {err}")
 
-pool = graphql.get_pooled_payments(send_from)
-print(len(pool["pooledUserCommands"]))
-print(pool["pooledUserCommands"])
+try:
+    queued = len(graphql.get_pooled_payments(send_from)["pooledUserCommands"])
+    print(f'{queued} payment(s) queued in the mempool')
+except Exception as err:
+    print(f'Could not read the mempool: {err}')
 
-# Let's check all transactions status
-print(f'Starting verification of sent transactions. Checker timer = {TX_CHECK_TIMER / 60} min')
-while len(TX_LIST_TO_CHECK):
-    tx_data = ""
-    print(f'{len(TX_LIST_TO_CHECK)} pending txs in the pool. Timer timeout = {TX_CHECK_TIMER} sec')
-    for n, tx in enumerate(TX_LIST_TO_CHECK, start=1):
-        t1 = time.time()
+# Wait for inclusion in a block. This is not the 17-hour wait to K=290 finality,
+# just a block or two - but it matters: reconcile.py reads the chain, so a
+# transaction still in the pool would be recorded as never paid.
+print(f'\nWaiting for {len(TX_LIST_TO_CHECK)} payment(s) to be included '
+      f'(up to {TX_CHECK_TIMER / 60:.0f} min)')
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
+deadline = time.time() + TX_CHECK_TIMER
+bar = tqdm(total=len(TX_LIST_TO_CHECK), unit="tx", desc="  included", ncols=100,
+           bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
+                      "[{elapsed}<{remaining}{postfix}]") if tqdm else None
+
+
+def _say(msg):
+    bar.write(msg) if bar else print(msg, flush=True)
+
+
+errors = 0
+while TX_LIST_TO_CHECK and time.time() < deadline:
+    for tx in list(TX_LIST_TO_CHECK):
+        if time.time() >= deadline:
+            break
         tx_hash = tx["sendPayment"]["payment"]["id"]
         try:
-            tx_data = graphql.get_transaction_status(tx_hash)
+            tx_data = str(graphql.get_transaction_status(tx_hash))
         except Exception as tx_status_err:
-            print(f'Can\'t get TX status: {tx_status_err}')
-            TX_CHECK_TIMER -= time.time() - t1
+            errors += 1
+            if errors in (1, 10, 100):      # don't paper the screen with these
+                _say(f"  can't read a tx status ({tx_status_err}), still trying")
             continue
 
-        if "error" in str(tx_data):
-            print(f'Can\'t get TX status {tx_data}')
-            TX_CHECK_TIMER -= time.time() - t1
+        if "error" in tx_data:
+            errors += 1
             continue
 
-        if "INCLUDED" in str(tx_data) or "included" in str(tx_data):
-            print(f'Transaction sent successfully: https://minascan.io/mainnet/tx/{tx_hash}')
+        if "INCLUDED" in tx_data or "included" in tx_data:
             TX_LIST_TO_CHECK.remove(tx)
+            if bar:
+                bar.update(1)
 
-        time.sleep(1)
+    if TX_LIST_TO_CHECK:
+        if bar:
+            bar.set_postfix_str(f"{len(TX_LIST_TO_CHECK)} pending", refresh=True)
+        time.sleep(5)
 
-        TX_CHECK_TIMER -= time.time() - t1
-        if TX_CHECK_TIMER <= 0:
-            print(f'Timeout: Transaction verification took too long. Save failed transactions and exit\n'
-                  f'Unconfirmed transactions: {len(TX_LIST_TO_CHECK)}')
-            for tx_ in TX_LIST_TO_CHECK:
-                tx_ = tx_["sendPayment"]["payment"]
-                to_addr = tx_["to"]
-                amount_wei = tx_["amount"]
-                amount_in_mina = int(amount_wei) / 1e9
-                FAILED_PAYOUTS_LST.append(f'{to_addr};{str(amount_wei)};{str(amount_in_mina)};;')
-            with open(FAILED_PAYOUTS_FILE, "w") as failed_f:
-                for t in FAILED_PAYOUTS_LST:
-                    failed_f.write(f'{t}\n')
-            print(f'Check file with failed txs - {FAILED_PAYOUTS_FILE}')
-            sys.exit(1)
+if bar:
+    bar.close()
 
-        if len(TX_LIST_TO_CHECK) == 0:
-            print("All transactions are successfully confirmed!")
-            sys.exit(0)
+if not TX_LIST_TO_CHECK:
+    print(f'\nAll {len(rows)} payment(s) confirmed.')
+    if os.path.exists('reconcile.py'):
+        print(f'Next: python3 reconcile.py --epoch {EPOCH} --commit')
+    sys.exit(0)
+
+# Timed out with some still in the pool. They may yet land, so they are recorded
+# for a retry rather than assumed lost - and reconcile.py will refuse to commit
+# until the chain says one way or the other.
+print(f'\nTimed out with {len(TX_LIST_TO_CHECK)} payment(s) not yet included.')
+for tx_ in TX_LIST_TO_CHECK:
+    tx_ = tx_["sendPayment"]["payment"]
+    amount_wei = tx_["amount"]
+    FAILED_PAYOUTS_LST.append(
+        f'{tx_["to"]};{amount_wei};{int(amount_wei) / 1e9};;')
+with open(FAILED_PAYOUTS_FILE, "w") as failed_f:
+    for t in FAILED_PAYOUTS_LST:
+        failed_f.write(f'{t}\n')
+print(f'Written to {FAILED_PAYOUTS_FILE}. They may still be included - check '
+      f'before resending:')
+print(f'  python3 reconcile.py --epoch {EPOCH}')
+sys.exit(1)
