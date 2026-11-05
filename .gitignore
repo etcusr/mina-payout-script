@@ -56,3 +56,9 @@ src/
 .vscode/
 .idea/
 .DS_Store
+
+# Private runtime state and task snapshots
+.payout-state/
+
+# Local operational plan contains private node and historical payout context.
+docs/superpowers/plans/2026-11-05-payout-hardening.md

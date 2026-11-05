@@ -39,8 +39,21 @@ LATEST_BLOCK_HEIGHT: 0
 # finality is K=290, which is what the archive's chain_status='canonical'
 # means - roughly 17 hours of waiting. Raise this if you prefer that.
 CONFIRMATIONS_NUM: 20
+# Successful outgoing payments: Applied + 3 descendants of the payment block.
+# Explicit setting also applies to existing plans; the effective threshold is
+# recorded with each confirmation proof without changing immutable payment data.
+TX_CONFIRMATIONS_NUM: 3
+# Before calculating/sending a later payout epoch, freshly verify previous
+# payouts with at least 15 descendants. Wallet withdrawals recheck at TX depth.
+PREVIOUS_PAYOUT_CONFIRMATIONS_NUM: 15
 
-# Rewards below this many MINA are skipped (not worth the tx fee).
+# send_payout.py / withdraw.py (and aliases) automatically back up and settle.
+# Maximum confirmation wait in seconds; expiry stays pending, never "paid".
+# Use the printed continuation command; never repeat --new-operation.
+# --wait-seconds overrides this setting.
+AUTO_SETTLE_WAIT_SECONDS: 3600
+
+# Rewards below this many MINA carry forward after verified reconciliation.
 MINIMUM_PAYOUT: 0.1
 
 # Own addresses that stake here but should not be sent a payout. The coinbase
@@ -74,12 +87,19 @@ GRAPHQL_PORT: 3085
 
 # Mina archive Postgres. Tunnel it the same way if it is remote:
 #   ssh -N -L 5432:127.0.0.1:5432 user@your-node
-ARCHIVE_DB_URL: "postgresql://postgres:postgres@127.0.0.1:5432/archive"
+ARCHIVE_DB_URL: "postgresql://payout_reader:REPLACE_ME@127.0.0.1:5432/archive"
+# Use a SELECT-only database login. Never expose database/GraphQL ports publicly.
+SSH_HOST: your-ssh-alias
+REMOTE_GRAPHQL_PORT: 6521  # set to the actual daemon port on your host
+REMOTE_PG_PORT: 5432
+EXPECTED_CHAIN_ID: REPLACE_WITH_YOUR_DAEMON_CHAIN_ID
+# Required only when explicitly importing historical epoch-numbered artifacts:
+# LEGACY_PROTOCOL_VERSION_ID: 3
 
 
 ### PAYOUTS ###
 
-# Included in the payout memo, e.g. "e12-f1_mypool"
+# Historical pool label. New memos use era + epoch + immutable input fingerprint.
 VALIDATOR_NAME: mypool
 
 # The wallet that receives the coinbase and sends the payouts.
@@ -89,8 +109,8 @@ SEND_FROM_ADDRESS: B62q...
 # Transaction fee in nanomina. 10000000 = 0.01 MINA
 DEFAULT_TX_FEE: 10000000
 
-# How long send_payout.py waits for its transactions to be included, in
-# seconds. Anything still unconfirmed is written to failed_payouts_<epoch>.csv
+# Bounded confirmation wait in seconds. Timeout leaves a resumable pending
+# journal entry; it NEVER creates a file authorizing repayment.
 TX_CHECK_TIMER_SECONDS: 2000
 
 # Wallet password is NOT stored here. send_payout.py and withdraw.py prompt
@@ -135,3 +155,26 @@ WITHDRAW_MEMO: ""
 #
 # MINIMUM_PAYOUT is applied to the final merged transfer, not per delegator -
 # small shares that would be dropped on their own still count once combined.
+
+
+### COMMISSION HISTORY (optional) ###
+# Effective rates are frozen in every immutable plan. A schedule must cover
+# each requested era/epoch. Rows inherit unspecified rates from earlier rows
+# in that era, then from the base rates above. Never edit a historical plan.
+# COMMISSION_SCHEDULE:
+#   - era: 3
+#     from_epoch: 0
+#     VALIDATOR_FEE: 0.05
+#     VALIDATOR_FEE_SP: 0.05
+#     VALIDATOR_FEE_FOUNDATION: 0.05
+#     VALIDATOR_FEE_O1LABS: 0.05
+#   - era: 3
+#     from_epoch: 10
+#     VALIDATOR_FEE: 0.10
+
+# Preflight bounds. No fallback to cached/archive-only chain tips is permitted
+# for financial decisions. See README for scope and recovery.
+PREFLIGHT_CONNECT_TIMEOUT_SECONDS: 10
+PREFLIGHT_TIMEOUT_SECONDS: 30
+PREFLIGHT_SQL_TIMEOUT_SECONDS: 30
+PREFLIGHT_MAX_SECONDS: 90

@@ -98,22 +98,28 @@ class MinaClient:
 
     # --- payments ----------------------------------------------------------
 
-    def send_payment(self, to_pk, from_pk, amount, fee, memo):
+    def send_payment(self, to_pk, from_pk, amount, fee, memo, *, nonce):
         """Submit a payment. The sending wallet must be unlocked first.
 
         `amount` and `fee` are in nanomina.
         """
+        if type(nonce) is not int or not 0 <= nonce < 2**32:
+            raise ValueError('explicit UInt32 nonce required')
+        for value in (amount, fee):
+            if type(value) is not int or not 0 <= value < 2**64:
+                raise ValueError('exact UInt64 nanomina required')
+        if amount == 0: raise ValueError('payment amount must be positive')
         return self._request("""
             mutation($from: PublicKey!, $to: PublicKey!, $amount: UInt64!,
-                     $fee: UInt64!, $memo: String) {
+                     $fee: UInt64!, $memo: String, $nonce: UInt32!) {
               sendPayment(input: {
-                from: $from, to: $to, amount: $amount, fee: $fee, memo: $memo
+                from: $from, to: $to, amount: $amount, fee: $fee, memo: $memo, nonce: $nonce
               }) {
-                payment { id nonce from to amount fee memo }
+                payment { id hash nonce from to amount fee memo }
               }
             }
         """, {"from": from_pk, "to": to_pk, "amount": str(amount),
-              "fee": str(fee), "memo": memo})
+              "fee": str(fee), "memo": memo, "nonce": str(nonce)})
 
     def get_pooled_payments(self, pk):
         """User commands sitting in the mempool for this account."""
