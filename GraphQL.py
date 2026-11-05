@@ -27,6 +27,7 @@ import json
 import os
 import re
 import time
+import sys
 from decimal import Decimal
 from pathlib import Path
 
@@ -66,13 +67,14 @@ _hash_to_epoch = {}
 
 
 def _log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
 
 def _config():
     global _cfg_cache
     if _cfg_cache is None:
-        _cfg_cache = yaml.safe_load(_CONFIG_PATH.read_text(encoding="utf8"))
+        from tunnel import load_config
+        _cfg_cache = load_config(_CONFIG_PATH)
     return _cfg_cache
 
 
@@ -316,7 +318,7 @@ def _download_ledger(epoch, ledger_hash):
     _ensure_cache()
     cached = _LEDGERS_CACHE / f"epoch-{epoch}-{ledger_hash}.json"
     if cached.exists():
-        return json.loads(cached.read_bytes())
+        return json.loads(cached.read_bytes(), parse_float=Decimal)
     fname = _resolve_ledger_filename(epoch, ledger_hash)
     url = f"{GCS_LEDGERS_URL}/{fname}"
     _log(f"  downloading staking ledger {fname} (~286 MB, cached after first run)...")
@@ -350,27 +352,37 @@ def _download_ledger(epoch, ledger_hash):
             bar.close()
         tmp.replace(cached)
     _log(f"  ledger downloaded in {time.time()-t0:.1f}s, {cached.stat().st_size:,} bytes")
-    return json.loads(cached.read_bytes())
+    return json.loads(cached.read_bytes(), parse_float=Decimal)
 
 
 def _compute_untimed_slot(timing):
-    """Slot at which a timed account becomes fully unlocked.
+    """Exact final vesting slot, matching Mina minimum-balance semantics.
 
-    Mirrors original Staking.py logic. All amount fields scale uniformly so the
-    ratio is dimensionless — works whether stored as MINA strings or nanomina.
+    All five fields are required and nonnegative/finite. Slot fields are UInt32.
+    Amount units cancel in the exact ratio. 2**32 means never unlocked within
+    the protocol's UInt32 slot range, including zero-increment schedules.
     """
+    from fractions import Fraction
+    from money import parse_decimal
+    if not isinstance(timing,dict): raise ValueError('timing must be a complete object')
+    values={}
     try:
-        cliff_time = int(timing.get("cliff_time", 0))
-        vest_period = int(timing.get("vesting_period", 0))
-        cliff_amount = Decimal(str(timing.get("cliff_amount", 0)))
-        initial = Decimal(str(timing.get("initial_minimum_balance", 0)))
-        vest_incr = Decimal(str(timing.get("vesting_increment", 0)))
-    except Exception:
-        return 0
-    if vest_period == 0 or vest_incr == 0:
-        return cliff_time
-    n_steps = int((initial - cliff_amount) // vest_incr)
-    return cliff_time + n_steps * vest_period
+        for name in ('cliff_time','vesting_period','cliff_amount','initial_minimum_balance','vesting_increment'):
+            value=parse_decimal(timing[name])
+            if value<0: raise ValueError('negative vesting parameter')
+            if name in ('cliff_time','vesting_period'):
+                if value!=value.to_integral_value() or value>=2**32: raise ValueError('vesting slots must be UInt32')
+                values[name]=int(value)
+            else: values[name]=Fraction(value)
+    except (KeyError,TypeError): raise ValueError('missing or invalid vesting parameter') from None
+    cliff=values['cliff_time']; period=values['vesting_period']; initial=values['initial_minimum_balance']
+    remaining=initial-values['cliff_amount']; increment=values['vesting_increment']
+    if initial==0: return 0
+    if remaining<=0 or period==0: return cliff
+    if increment==0: return 2**32
+    ratio=remaining/increment
+    steps=(ratio.numerator+ratio.denominator-1)//ratio.denominator
+    return min(2**32,cliff+steps*period)
 
 
 # --- public API ------------------------------------------------------------
@@ -738,9 +750,8 @@ def getBaseCoinbase():
         (_protocol_version_id(),),
     )
     if v is None:
-        _log("  WARNING: no coinbase found for current era, falling back to 720")
-        return 720
-    coinbase = int(v) / NANOMINA
+        raise ValueError('no base coinbase evidence for requested protocol era')
+    coinbase = Decimal(int(v)) / NANOMINA
     _log(f"  base coinbase for this era: {coinbase} MINA")
     return coinbase
 
@@ -771,49 +782,24 @@ def getEpochBlockRange(epoch):
 
 
 def getLedgerHash(epoch):
-    """Resolve the staking-ledger hash used IN the given epoch.
+    """Resolve era-qualified staking hash from canonical/captured archive blocks.
 
-    Strategy:
-      1. Ask daemon for current/next epoch hashes (cheap)
-      2. Otherwise scan GCS bucket for `staking-{epoch}-*.json`
+    Epoch numbers reset at hard forks; bucket modification time is not identity.
+    The ledger download is selected by this exact hash and frozen in the plan.
     """
-    epoch = int(epoch)
-    try:
-        j = _daemon_query("""
-            { bestChain(maxLength: 1) {
-                protocolState { consensusState {
-                  epoch
-                  stakingEpochData { ledger { hash } }
-                  nextEpochData    { ledger { hash } }
-                } } } }
-        """)
-        cs = j["data"]["bestChain"][0]["protocolState"]["consensusState"]
-        cur = int(cs["epoch"])
-        if epoch == cur:
-            h = cs["stakingEpochData"]["ledger"]["hash"]
-            _hash_to_epoch[h] = epoch
-            return h
-        if epoch == cur + 1:
-            h = cs["nextEpochData"]["ledger"]["hash"]
-            _hash_to_epoch[h] = epoch
-            return h
-    except Exception as e:
-        _log(f"  (daemon GraphQL unreachable: {e}; falling back to GCS bucket)")
-
-    items = _gcs_list(
-        "mina-staking-ledgers",
-        prefix=f"staking-{epoch}-",
-        max_results=200,
-    )
-    if not items:
-        raise RuntimeError(f"no staking ledger found in GCS for epoch {epoch}")
-    items.sort(key=lambda it: it.get("updated", ""), reverse=True)
-    m = re.match(rf"staking-{epoch}-([^-]+)-", items[0]["name"])
-    if not m:
-        raise RuntimeError(f"unrecognised ledger filename: {items[0]['name']}")
-    h = m.group(1)
-    _hash_to_epoch[h] = epoch
-    return h
+    epoch=int(epoch)
+    ids=sorted(_best_chain_cache['ids']) if _best_chain_cache is not None else []
+    rows=_query_dict("""SELECT DISTINCT h.value AS ledger_hash
+        FROM blocks b JOIN epoch_data ed ON ed.id=b.staking_epoch_data_id
+        JOIN snarked_ledger_hashes h ON h.id=ed.ledger_hash_id
+        WHERE b.protocol_version_id=%(era)s
+          AND b.global_slot_since_hard_fork / %(slots)s = %(epoch)s
+          AND (b.chain_status='canonical' OR b.id=ANY(%(ids)s))""",
+        {'era':_protocol_version_id(),'slots':_slots_per_epoch(),'epoch':epoch,'ids':ids})
+    if len(rows)!=1 or not rows[0]['ledger_hash']:
+        raise ValueError('archive epoch has missing or ambiguous staking-ledger hash')
+    ledger_hash=rows[0]['ledger_hash']; _hash_to_epoch[ledger_hash]=epoch
+    return ledger_hash
 
 
 def _resolve_epoch_for_hash(ledger_hash):
@@ -871,14 +857,14 @@ def getStakingLedger(variables):
         if acc.get("delegate") != delegate:
             continue
         timing = acc.get("timing")
-        if timing:
+        if timing is not None:
+            untimed_slot = _compute_untimed_slot(timing)
             timing = dict(timing)
-            timing["untimed_slot"] = _compute_untimed_slot(timing)
+            timing["untimed_slot"] = untimed_slot
             timing["timed_epoch_end"] = False
-        try:
-            balance = float(acc.get("balance", 0))
-        except (ValueError, TypeError):
-            balance = 0.0
+        from money import parse_decimal
+        balance = parse_decimal(acc['balance'])
+        if balance < 0: raise ValueError('negative staking balance')
         stakes.append({
             "public_key": acc.get("pk"),
             "balance": balance,
@@ -926,95 +912,74 @@ def _probe_schema():
         "bic_has_status": bic_has_status,
         "buc_has_status": buc_has_status,
     }
-    _log(f"  schema probe: {_schema_probe}")
+    if os.environ.get("MINA_DEBUG") == "1":
+        _log(f"  schema probe: {_schema_probe}")
     return _schema_probe
 
 
 def _decode_memo(memo):
-    """Mina memos are stored base58check-encoded. Return the readable string.
+    from payout_workflow import decode_memo
+    return decode_memo(memo)
 
-    Layout after decoding: [version 0x14][tag][length][payload ... padding].
-    Tag 1 is a byte string, which is what the CLI and this project write.
-    Anything that does not decode cleanly comes back as-is, so a caller can
-    still see what is in the column.
+
+def getSentPayments(from_pk, memo_prefix=None, min_height=None, epoch=None, *, health=None, config=None):
+    """Full applied payment identities on the producer-captured ancestry.
+
+    No daemon/archive-tip fallback or cached branch can authorize accounting.
+    ``health`` must be a fresh preflight result; legacy callers obtain one here.
     """
-    A = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-    try:
-        n = 0
-        for ch in memo:
-            n = n * 58 + A.index(ch)
-        raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
-        raw = b"\x00" * (len(memo) - len(memo.lstrip("1"))) + raw
-        body = raw[:-4]                       # drop the checksum
-        if len(body) < 3 or body[1] != 1:
-            return memo
-        return body[3:3 + body[2]].decode("utf-8", "replace")
-    except Exception:
-        return memo
-
-
-def getSentPayments(from_pk, memo_prefix=None, min_height=None, epoch=None):
-    """Payments actually sent from `from_pk`, read from the archive.
-
-    This is the chain's own record, so it counts what was included in a block -
-    not what a script believed it submitted. Transactions that were signed but
-    never made it in simply do not appear, and anything sent by hand from a
-    wallet does.
-
-    Only blocks on the current best chain are considered, so an orphaned block's
-    payments do not count. Pass `memo_prefix` to keep only the payments whose
-    decoded memo starts with it; send_payout.py writes 'e<N>-f1_<validator>',
-    which makes the memo an epoch tag.
-
-    Returns [{to, amount_mina, height, memo, hash}], newest block first.
-    """
-    # Payouts for an epoch are sent once it has ended, so they land in blocks at
-    # or above its first one. Giving the chain walk that floor keeps it from
-    # crawling back to genesis - without it the recursive query is the slowest
-    # thing in the script by a wide margin.
-    if min_height is None and epoch is not None:
-        h_min, _ = getEpochBlockRange(epoch)
-        if h_min:
-            min_height = h_min
-
+    if config is not None:
+        configure(config)
+    if health is None:
+        import preflight
+        health = preflight.check(_config(), epoch=epoch, require_wallet=False)
     probe = _probe_schema()
-    chain_ids = sorted(_best_chain(min_height=min_height)["ids"])
-
-    status_ok = ""
-    if probe["buc_has_status"]:
-        status_ok = "AND buc.status = 'applied'"
-
+    if not probe['buc_has_status']:
+        raise ValueError('archive lacks explicit applied payment status; cannot prove successful transfers')
+    ancestors = {int(b['id']):b for b in health['best_chain']}
+    if not ancestors: raise ValueError('empty authoritative ancestry')
     rows = _query_dict(f"""
-        SELECT pk_to.value          AS to_pk,
-               uc.amount            AS amount,
-               uc.memo              AS memo,
-               uc.hash              AS hash,
-               b.height             AS height
+        SELECT pk_from.value AS from_pk, pk_to.value AS to_pk,
+               uc.amount, uc.fee, uc.nonce, uc.memo, uc.hash,
+               b.id AS block_id, b.state_hash AS block_hash, b.height,
+               b.protocol_version_id AS era, buc.status
         FROM blocks_user_commands buc
-        JOIN user_commands uc  ON uc.id = buc.user_command_id
-        JOIN blocks b          ON b.id  = buc.block_id
-        JOIN public_keys pk_from ON pk_from.id = uc.source_id
-        JOIN public_keys pk_to   ON pk_to.id   = uc.receiver_id
-        WHERE pk_from.value = %(from_pk)s
-          AND uc.{probe["uc_type_col"]} = 'payment'
-          AND b.id = ANY(%(chain_ids)s)
-          {status_ok}
-        ORDER BY b.height DESC
-        """, {"from_pk": from_pk, "chain_ids": chain_ids})
-
-    out = []
-    for r in rows:
-        memo = _decode_memo(r["memo"] or "")
-        if memo_prefix and not memo.startswith(memo_prefix):
-            continue
-        out.append({
-            "to": r["to_pk"],
-            "amount_mina": int(r["amount"]) / NANOMINA,
-            "height": r["height"],
-            "memo": memo,
-            "hash": r["hash"],
-        })
+        JOIN user_commands uc ON uc.id=buc.user_command_id
+        JOIN blocks b ON b.id=buc.block_id
+        JOIN public_keys pk_from ON pk_from.id=uc.source_id
+        JOIN public_keys pk_to ON pk_to.id=uc.receiver_id
+        WHERE pk_from.value=%(from_pk)s AND uc.{probe['uc_type_col']}='payment'
+          AND b.id=ANY(%(chain_ids)s) AND buc.status='applied'
+        ORDER BY b.height DESC,uc.nonce
+        """, {'from_pk':from_pk,'chain_ids':list(ancestors)})
+    from money import nano_to_mina
+    out=[]
+    for row in rows:
+        ancestor=ancestors[int(row['block_id'])]
+        if row['block_hash']!=ancestor['state_hash'] or row['status']!='applied':
+            raise ValueError('payment proof does not belong to captured successful ancestry')
+        memo=_decode_memo(row['memo'] or '')
+        if memo_prefix and not memo.startswith(memo_prefix): continue
+        out.append({'wallet':row['from_pk'],'recipient':row['to_pk'],'to':row['to_pk'],
+            'amount_nano':int(row['amount']),'amount_mina':nano_to_mina(int(row['amount'])),
+            'fee_nano':int(row['fee']),'nonce':int(row['nonce']),'memo':memo,
+            'hash':row['hash'],'tx_hash':row['hash'],'height':int(row['height']),
+            'block_hash':row['block_hash'],'network':health['network'],'era':str(row['era']),
+            'status':'applied','on_best_chain':True,'depth':int(ancestor['depth'])})
     return out
+
+
+def configure(config, health=None):
+    """Pin one calculation to fresh validated connection/ancestry evidence."""
+    global _cfg_cache, _pv_cache, _best_chain_cache, _db_conn_cache, _schema_probe
+    if _db_conn_cache is not None and not _db_conn_cache.closed:
+        _db_conn_cache.close()
+    _db_conn_cache=None; _schema_probe=None
+    _cfg_cache=dict(config); _pv_cache=None; _best_chain_cache=None
+    if health is not None:
+        _pv_cache=int(health['era'])
+        _best_chain_cache={'ids':{b['id'] for b in health['best_chain']},'tip_hash':health['tip_hash'],
+            'tip_height':health['tip_height'],'min_height':min(b['height'] for b in health['best_chain'])}
 
 
 def getBlocks(variables):

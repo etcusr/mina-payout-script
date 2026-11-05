@@ -1,7 +1,7 @@
 # Shell aliases for the Mina payout scripts. Works in bash and zsh.
 #
-# Install:
-#   echo "source /path/to/mina-payout-script/scripts/aliases.sh" >> ~/.zshrc
+# Load in the current shell, from the project root:
+#   source ./scripts/aliases.sh
 #
 # Optional - lets `mina_tunnel` run without arguments:
 #   export MINA_SSH_HOST=my-node
@@ -46,7 +46,8 @@ mina_cd() {
 #   mina_calc 3 --vrf      epoch 3 + VRF slot scan
 mina_calc() { mina_cd && ./calc.sh "$@"; }
 
-# Send the payouts for an epoch (asks for the wallet password).
+# Back up, send, wait for proofs and settle an epoch (asks for the password).
+# Repeating the same command resumes the journal without duplicate payments.
 #   mina_pay --epoch 3
 mina_pay() { mina_cd && python3 send_payout.py "$@"; }
 
@@ -58,7 +59,9 @@ mina_reconcile() {
     python3 reconcile.py "$@"
 }
 
-# Withdraw commission to the cold wallet.
+# Back up, withdraw recorded income, wait and settle; repeats cannot repay it.
+# Manual amounts also debit income; --new-operation is for an explicit new manual transfer.
+#   mina_withdraw
 #   mina_withdraw --amount 252.5
 mina_withdraw() { mina_cd && python3 withdraw.py "$@"; }
 
@@ -70,3 +73,7 @@ mina_vrf() { mina_cd && python3 vrf/probe.py "$@"; }
 #   mina_tunnel my-node --bg
 #   mina_tunnel --stop
 mina_tunnel() { "$MINA_PAYOUT_DIR/scripts/tunnel.sh" "$@"; }
+
+# Read-only producer/archive health and local durable-state diagnostics.
+mina_doctor() { mina_cd && python3 payout_cli.py doctor "$@"; }
+mina_status() { mina_cd && python3 payout_cli.py status "$@"; }
