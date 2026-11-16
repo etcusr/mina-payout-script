@@ -111,7 +111,19 @@ def automatic_backup(workflow, label):
         return os.path.relpath(destination,workflow.root)
 
 
+def finish_progress(workflow):
+    finish=getattr(workflow.observer,'finish',None)
+    if callable(finish): finish()
+
+
 def complete_accounting(workflow, digest, seconds, resume_command):
+    try:
+        return _complete_accounting(workflow,digest,seconds,resume_command)
+    finally:
+        finish_progress(workflow)
+
+
+def _complete_accounting(workflow, digest, seconds, resume_command):
     """Poll fresh guarded reconciliation; a timeout is pending, never success."""
     import time
     from payout_workflow import PendingPayments
@@ -121,6 +133,7 @@ def complete_accounting(workflow, digest, seconds, resume_command):
         try:
             settlement=workflow.reconcile(digest,commit=True)
         except preflight.PreflightConnectionError:
+            finish_progress(workflow)
             disconnected=True
             remaining=deadline-time.monotonic()
             print(paint('Связь с нодой недоступна. Подтверждение пока проверить нельзя; отправленный перевод остаётся в журнале.','yellow'),flush=True)
@@ -134,6 +147,7 @@ def complete_accounting(workflow, digest, seconds, resume_command):
             time.sleep(min(15,max(0,deadline-time.monotonic())))
         except PendingPayments:
             if disconnected:
+                finish_progress(workflow)
                 print(paint('Связь восстановлена, свежие проверки пройдены. Ожидаю подтверждения перевода.','green'),flush=True)
                 disconnected=False
             remaining=deadline-time.monotonic()
@@ -144,6 +158,7 @@ def complete_accounting(workflow, digest, seconds, resume_command):
             time.sleep(min(15,remaining))
         else:
             if disconnected:
+                finish_progress(workflow)
                 print(paint('Связь восстановлена, подтверждение проверено по свежей цепочке.','green'),flush=True)
             # Completion is only reported after a post-settlement backup too.
             backup=automatic_backup(workflow,'after-'+digest[:12])
@@ -334,25 +349,30 @@ def main(argv=None):
                     elif not args.dry_run and not result.get('nothing_to_withdraw'):
                         print(json.dumps(result,default=str,sort_keys=True))
                         result=wait_for_proofs(workflow,result['plan'],args.wait_seconds if args.wait_seconds is not None else config.get('TX_CHECK_TIMER_SECONDS',0))
+        if display: display.finish()
         if getattr(args,'complete',False) and not args.dry_run:
             completion_report(result)
         else:
             print(json.dumps(result,sort_keys=True,default=str))
         return exit_code
     except KeyboardInterrupt:
+        if display: display.finish()
         print('Прервано. Состояние сохранено. При продолжении вывода не используйте --new-operation.',file=sys.stderr)
         if resume_hint: print('Для продолжения: '+resume_hint,file=sys.stderr)
         return 130
     except (preflight.PreflightError,tunnel.TunnelError,StateError) as error:
+        if display: display.finish()
         if display: print(paint('Проверка/операция остановлена. Успешное завершение не подтверждено.','red',stream=sys.stderr),file=sys.stderr)
         print(paint(str(error),'red',stream=sys.stderr),file=sys.stderr)
         if resume_hint: print('Для продолжения: '+resume_hint,file=sys.stderr)
         return 1
     except (OSError,sqlite3.Error,ValueError,KeyError,TypeError):
+        if display: display.finish()
         print(paint('Операция остановлена: проверьте настройки, входные суммы, сервисы и журнал. Не повторяйте перевод вручную.','red',stream=sys.stderr),file=sys.stderr)
         if resume_hint: print('Для продолжения: '+resume_hint,file=sys.stderr)
         return 1
     except Exception:
+        if display: display.finish()
         # Transport/driver errors can contain DSNs; never print raw exceptions.
         print(paint('Ошибка сервиса или учёта: операция остановлена. Требуется проверка состояния перед продолжением.','red',stream=sys.stderr),file=sys.stderr)
         if resume_hint: print('Для продолжения: '+resume_hint,file=sys.stderr)

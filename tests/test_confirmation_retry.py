@@ -1,6 +1,8 @@
 """Connection loss may repeat proof reads, never payment submission."""
 import contextlib
 import io
+import os
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -80,3 +82,36 @@ class ConfirmationRetryTests(unittest.TestCase):
             with self.assertRaises(preflight.PreflightError):
                 payout_cli.complete_accounting(self.w,self.digest,60,'mina_pay --epoch 8')
         ensure.assert_not_called(); self.assertIsNone(self.w.store().settlement(self.digest))
+
+    def test_terminal_progress_finishes_on_timeout_and_interrupt(self):
+        from payout_display import PayoutDisplay
+        for interrupted in (False,True):
+            output=io.StringIO(); self.w.observer=PayoutDisplay()
+            with self.subTest(interrupted=interrupted),patch.object(output,'isatty',return_value=True), \
+                 patch.dict(os.environ,{'TERM':'xterm','NO_COLOR':''}), \
+                 patch('shutil.get_terminal_size',return_value=os.terminal_size((180,50))), \
+                 patch('time.sleep',side_effect=KeyboardInterrupt),contextlib.redirect_stdout(output):
+                if interrupted:
+                    with self.assertRaises(KeyboardInterrupt):
+                        payout_cli.complete_accounting(self.w,self.digest,60,'mina_pay --epoch 8')
+                else:
+                    result=payout_cli.complete_accounting(self.w,self.digest,0,'mina_pay --epoch 8')
+                    self.assertFalse(result['settled'])
+            self.assertTrue(output.getvalue().endswith('\n'))
+            self.assertEqual(sum(isinstance(x,tuple) for x in self.fake.calls),1)
+
+    def test_connection_warning_starts_after_progress_on_a_new_line(self):
+        from payout_display import PayoutDisplay
+        output=io.StringIO(); self.w.observer=PayoutDisplay(); clock=[0]
+        def lose_connection(_):
+            clock[0]=61
+            self.fake.health=lambda *a,**k: (_ for _ in ()).throw(self.connection_error())
+        with patch.object(output,'isatty',return_value=True), \
+             patch.dict(os.environ,{'TERM':'xterm','NO_COLOR':''}), \
+             patch('shutil.get_terminal_size',return_value=os.terminal_size((180,50))), \
+             patch('time.monotonic',side_effect=lambda:clock[0]), \
+             patch('time.sleep',side_effect=lose_connection),contextlib.redirect_stdout(output):
+            result=payout_cli.complete_accounting(self.w,self.digest,60,'mina_pay --epoch 8')
+        plain=re.sub(r'\x1b\[[0-9;]*m','',output.getvalue())
+        self.assertIn('\nСвязь с нодой недоступна.',plain)
+        self.assertFalse(result['settled'])

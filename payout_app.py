@@ -142,7 +142,7 @@ def calculate_epoch(workflow,epoch,*,preview=False,provider=live_inputs):
 def report(result):
     """Human report; frozen calculation and current wallet are labelled separately."""
     from payout_display import mina, paint, account_link, status_tone
-    from tabulate import tabulate
+    from payout_display import table
     if 'legacy' in result:
         r=result['legacy']
         print(f"Эпоха {r['epoch']} · исторические выплаты (только чтение)")
@@ -172,7 +172,7 @@ def report(result):
         label=('потерян, не учтён' if b['lost'] else 'ожидает глубины' if not b['mature']
                else 'учтён в расчёте' if b.get('height') in reward_heights else 'вне расчёта')
         rows.append([b.get('height','—'),b.get('coinbase_mina','—'),b.get('confirmations','—'),paint(label,'red' if b['lost'] else 'green' if label=='учтён в расчёте' else 'yellow')])
-    print(tabulate(rows,headers=['Высота','Награда блока MINA','Блоков после','Результат'],tablefmt='simple',disable_numparse=True) if rows else '  Нет блоков в отчёте.')
+    print(table(rows,headers=['Высота','Награда блока MINA','Блоков после','Результат'],) if rows else '  Нет блоков в отчёте.')
     print('\nРаспределение за эпоху (сохранённый расчёт)' if result.get('existing') else '\nРаспределение за эпоху')
     for label,key in [('Награды с учётом tx/SNARK-комиссий','total_reward_nano'),
                       ('Доля валидатора, включая округление','validator_nano'),
@@ -193,7 +193,7 @@ def report(result):
         if label is None:
             label='к отправке' if send else 'ниже минимума' if after>0 and after<policy.get('minimum_nano',0) else 'нет выплаты'
         rows.append([account_link(a),mina(gross),mina(before),mina(send),mina(after),paint(label,status_tone(status.get('by_recipient',{}).get(a)))])
-    print(tabulate(rows,headers=['Адрес получателя','Начислено','Долг до','К выплате','Остаток после','Статус'],tablefmt='simple',disable_numparse=True,colalign=('left','right','right','right','right','left')) if rows else '  Получателей нет.')
+    print(table(rows,headers=['Адрес получателя','Начислено','Долг до','К выплате','Остаток после','Статус'],colalign=('left','right','right','right','right','left')) if rows else '  Получателей нет.')
     total=sum(c['net_nano'].values()); fees=len(c['net_nano'])*policy['fee_nano']
     print(f"\nПо плану: {len(c['net_nano'])} платежей · {mina(total)} MINA")
     print(f"Сетевые комиссии: {mina(fees)} MINA · Всего с комиссиями: {mina(total+fees)} MINA")
@@ -210,7 +210,7 @@ def report(result):
             rows.append([account_link(s['public_key']),str(s['balance']),'есть' if locked else 'нет',
                          'исключён из выплат' if s['public_key'] in policy.get('exclusions',[]) else 'участвует'])
         print(paint('\nДелегации из staking ledger расчёта · вестинг на слот последнего учтённого блока','cyan'))
-        print(tabulate(rows,headers=['Адрес делегатора','Стейк MINA','Вестинг','Участие'],tablefmt='simple',disable_numparse=True))
+        print(table(rows,headers=['Адрес делегатора','Стейк MINA','Вестинг','Участие'],))
     if policy.get('redirects'):
         print('Перенаправления выплат (исходный адрес → получатели и веса):')
         for source,targets in policy['redirects'].items():

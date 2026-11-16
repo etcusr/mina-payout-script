@@ -95,7 +95,7 @@ class ConvenienceTests(unittest.TestCase):
         self.assertEqual(code,0,error)
         self.assertIn('0.000000117',out)
         self.assertIn('Доход владельца',out)
-        final=out.split('Итоговый учёт · данные БД')[-1]
+        final=out.split('Итоговый учёт · данные БД')[-1].replace('│',' ')
         self.assertIn('Итоговый учёт · данные БД',out)
         self.assertLess(out.index('Сверка завершена'),out.index('Итоговый учёт · данные БД'))
         self.assertRegex(final,r'Выведено \(с комиссиями\)\s+0\.000000118')
@@ -105,7 +105,7 @@ class ConvenienceTests(unittest.TestCase):
         self.assertEqual(code,0,error)
         self.assertIn('Новых средств для вывода нет',out)
         self.assertIn('Итоговый учёт · данные БД',out)
-        self.assertRegex(out.split('Итоговый учёт · данные БД')[-1],r'Выведено \(с комиссиями\)\s+0\.000000118')
+        self.assertRegex(out.split('Итоговый учёт · данные БД')[-1].replace('│',' '),r'Выведено \(с комиссиями\)\s+0\.000000118')
         self.assertEqual(self.sent_count(),1)
 
     def test_screen_shows_checks_plan_receipt_and_pool_without_false_completion(self):
