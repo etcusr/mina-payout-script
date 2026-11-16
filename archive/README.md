@@ -97,14 +97,24 @@ bucket, and when the Foundation deleted that bucket the script began retrying
 the same missing block forever — hundreds of log lines per second, no progress,
 indefinitely.
 
-`scripts/blocks-guardian.sh` replaces it:
+`scripts/blocks-guardian.sh` launches `blocks_guardian.py` (Python 3.9+, `psql`, `mina-archive-blocks`). Install both files from `scripts/`.
 
-- tries several mirrors in order (GCS first, then S3)
-- validates the JSON before handing it to `mina-archive-blocks`
-- blacklists blocks that are unavailable everywhere instead of looping on them
-- asks the daemon which blocks are actually missing rather than guessing
+- Scans the entire canonical/pending history for absent parent hashes, independently of the recent 290-block window.
+- Walks exact parent hashes through GCS/S3 and imports oldest first using the official importer. Audit SQL is read-only.
+- Verifies importer receipts and exact DB rows; exit code 0 alone is not proof of success.
+- Repairs large gaps in bounded chunks. Unavailable blocks retry after 10 minutes to 6 hours, without permanent blacklisting. The legacy `guardian-failed.txt` is ignored.
+- Audits canonical gaps, duplicate heights, parent links and stale pending rows. Structural problems not repairable by importing absent blocks remain visible for investigation.
+- Prevents overlapping runs. Retry state persists in `/tmp/blocks-guardian` on the existing `guardian-tmp` volume.
 
-To add another mirror, append to the `SOURCES` array in that script.
+Environment settings: `GUARDIAN_LOOKBACK=290` (recent chain only), `GUARDIAN_MAX_BLOCKS=250`, `GUARDIAN_MAX_ROOTS=64`, `GUARDIAN_MAX_SECONDS=240` (repair budget; audit SQL has separate timeouts), `GUARDIAN_MAX_BYTES=268435456`, `GUARDIAN_MAX_FILE_BYTES=67108864`. Retry intervals: `GUARDIAN_RETRY_SECONDS=600`, `GUARDIAN_MAX_RETRY_SECONDS=21600`. `GUARDIAN_SOURCES` accepts comma-separated HTTPS directories. Optionally pin the chain with `GUARDIAN_EXPECTED_CHAIN_ID`.
+
+Audit without downloading or importing:
+
+```bash
+docker compose exec missing_blocks_guardian bash /scripts/blocks-guardian.sh --check
+```
+
+Exit codes: 0 means no detected problems, 2 means unresolved gaps/errors, 1 means the check could not complete. An overlapping process exits 0 with an explicit skip message. The existing loop runs every 600 seconds. For a running installation, copy the Python helper first, then replace the launcher; no validator restart is needed.
 
 ## Connecting the payout scripts
 

@@ -314,11 +314,32 @@ def _resolve_ledger_filename(epoch, ledger_hash):
     return items[0]["name"]
 
 
+def _decode_staking_ledger(payload):
+    # Mina token symbols are byte strings. Preserve non-UTF8 bytes as surrogates
+    # in that unused metadata field, never drop/replace bytes in payout inputs.
+    ledger=json.loads(payload.decode('utf-8-sig','surrogateescape'),parse_float=Decimal)
+    invalid=re.compile('[\ud800-\udfff]')
+    def validate(value):
+        if isinstance(value,str):
+            if invalid.search(value): raise ValueError('invalid UTF-8 outside staking token_symbol')
+        elif isinstance(value,dict):
+            for key,item in value.items(): validate(key); validate(item)
+        elif isinstance(value,list):
+            for item in value: validate(item)
+    if not isinstance(ledger,list): raise ValueError('staking ledger must be an account list')
+    for account in ledger:
+        if not isinstance(account,dict): raise ValueError('invalid staking account')
+        for key,value in account.items():
+            validate(key)
+            if key!='token_symbol' or not isinstance(value,str): validate(value)
+    return ledger
+
+
 def _download_ledger(epoch, ledger_hash):
     _ensure_cache()
     cached = _LEDGERS_CACHE / f"epoch-{epoch}-{ledger_hash}.json"
     if cached.exists():
-        return json.loads(cached.read_bytes(), parse_float=Decimal)
+        return _decode_staking_ledger(cached.read_bytes())
     fname = _resolve_ledger_filename(epoch, ledger_hash)
     url = f"{GCS_LEDGERS_URL}/{fname}"
     _log(f"  downloading staking ledger {fname} (~286 MB, cached after first run)...")
@@ -352,7 +373,7 @@ def _download_ledger(epoch, ledger_hash):
             bar.close()
         tmp.replace(cached)
     _log(f"  ledger downloaded in {time.time()-t0:.1f}s, {cached.stat().st_size:,} bytes")
-    return json.loads(cached.read_bytes(), parse_float=Decimal)
+    return _decode_staking_ledger(cached.read_bytes())
 
 
 def _compute_untimed_slot(timing):
