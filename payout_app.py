@@ -151,7 +151,7 @@ def report(result):
         return
     c=result['calculation']; policy=c['policy']; status=result.get('payment_status',{})
     print(f"\nЭпоха {result.get('epoch','—')} · расчёт выплат")
-    if result['preview']: print('Предварительный расчёт: эпоха ещё идёт, отправка недоступна.')
+    if result['preview']: print('Предварительный расчёт: план не сохранён, отправка по нему недоступна.')
     elif result.get('existing'): print('Сохранённый расчёт — суммы не пересчитывались.')
     else: print('Расчёт сохранён. Суммы зафиксированы для отправки.')
     if status:

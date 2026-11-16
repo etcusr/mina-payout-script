@@ -85,12 +85,14 @@ services:
     # Custom implementation instead of the Foundation's script from GitHub:
     #  - falls back across several block sources (GCS, then S3, ...), because
     #    the Foundation has a habit of deleting buckets
-    #  - blacklists permanently broken blocks instead of retrying them forever
+    #  - scans historical parent gaps and retries unavailable blocks with backoff
     #  - see ./scripts/blocks-guardian.sh
     environment:
       PG_CONN: postgres://postgres:postgres@postgres:5432/archive
       DAEMON_URL: http://mina_node:3085/graphql
       MINA_NETWORK: mainnet
+      GUARDIAN_MAX_BLOCKS: 250
+      GUARDIAN_MAX_SECONDS: 240
     command: >
       bash -c '
       while true; do

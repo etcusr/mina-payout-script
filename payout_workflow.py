@@ -86,15 +86,26 @@ class LiveAdapter:
     def health(self,epoch=None,wallet=False):
         import preflight
         return preflight.check(self.config,epoch=epoch,require_wallet=wallet)
+    def _expanded_proof(self,health,**bounds):
+        """Retry reads on ordinary tip extension; never bridge a reorganization."""
+        import preflight
+        anchor=health
+        for attempt in range(3):
+            deeper=preflight.check(self.config,require_wallet=False,**bounds)
+            if any(deeper[key]!=anchor[key] for key in ('network','era')):
+                raise StateError('Сеть или эра изменились при сверке; операция остановлена.')
+            if deeper['tip_hash']==anchor['tip_hash']: return deeper
+            if anchor['tip_hash'] not in {b['state_hash'] for b in deeper['best_chain']}:
+                raise StateError('Цепочка изменилась при сверке предыдущих платежей; повторите проверку.')
+            if attempt<2:
+                print(f'Во время сверки появился новый блок. Повторяю проверку: {attempt+2}/3.',flush=True)
+            anchor=deeper
+        raise StateError('Вершина цепочки менялась во всех 3 попытках сверки; повторите проверку.')
     def payments(self,health,epoch=None):
         import GraphQL
         if epoch is not None and (health.get('epoch_first_height') is None or
                 health.get('checked_epoch') is None or epoch < health['checked_epoch']):
-            import preflight
-            deeper=preflight.check(self.config,epoch=epoch,require_wallet=False)
-            if any(deeper[key]!=health[key] for key in ('tip_hash','network','era')):
-                raise StateError('producer moved during historical proof capture; retry read-only check')
-            health=deeper
+            health=self._expanded_proof(health,epoch=epoch)
         return GraphQL.getSentPayments(self.config['SEND_FROM_ADDRESS'],epoch=epoch,health=health,config=self.config)
     def unlock(self,password): return self.client.unlock_wallet(self.config['SEND_FROM_ADDRESS'],password)
     def previous_payments(self,health,expected):
@@ -112,10 +123,7 @@ class LiveAdapter:
              'eras':sorted({int(era) for _,era,_,_ in expected})})
         if floor is None: return []
         if min(b['height'] for b in health['best_chain'])>int(floor):
-            deeper=preflight.check(self.config,require_wallet=False,min_height=int(floor))
-            if any(deeper[key]!=health[key] for key in ('tip_hash','network','era')):
-                raise StateError('Producer moved during previous-payment proof capture; repeat the check.')
-            health=deeper
+            health=self._expanded_proof(health,min_height=int(floor))
         return GraphQL.getSentPayments(self.config['SEND_FROM_ADDRESS'],health=health,config=self.config)
     def lock(self): return self.client.lock_wallet(self.config['SEND_FROM_ADDRESS'])
     def submit(self,payment,nonce):
