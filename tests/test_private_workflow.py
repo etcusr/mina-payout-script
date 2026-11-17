@@ -25,6 +25,17 @@ class PrivateWorkflowTests(unittest.TestCase):
     def test_import_preserves_legacy_bytes_and_era(self):
         self.assertEqual(self.before,self.path.read_bytes()); self.assertEqual(self.w.carry(),{A:-25})
         with self.assertRaises(StateError): self.w.create_plan(6,{'gross_nano':{},'net_nano':{},'carry_before_nano':{A:-25},'carry_after_nano':{A:-25},'policy':{'fee_nano':1}}, {})
+    def test_delegate_fee_is_settled_once_across_private_ledger_crash_recovery(self):
+        d=self.w.create_plan(8,{'gross_nano':{A:100},'net_nano':{A:74},'carry_before_nano':{A:-25},
+            'carry_after_nano':{},'delegator_fees_nano':{A:1},'policy':{'fee_nano':1,'network_fee_source':'delegators'}}, {})
+        self.w.send(d,password='x'); self.fake.include()
+        with patch.object(StateStore,'settle',side_effect=OSError('fsync failure')):
+            with self.assertRaises(OSError): self.w.reconcile(d,commit=True)
+        self.w.reconcile(d,commit=True); self.w.reconcile(d,commit=True)
+        self.assertEqual(self.w.carry(),{})
+        data=self.ledger.load(self.path)
+        self.assertEqual(len(data['history']),2)
+        self.assertEqual(data['history'][1]['deltas'][A],self.ledger._amount('0.000000025'))
     def test_ledger_commit_then_journal_crash_recovers_without_double_delta(self):
         d=self.w.create_plan(8,{'gross_nano':{A:100},'net_nano':{A:75},'carry_before_nano':{A:-25},'carry_after_nano':{},'policy':{'fee_nano':1}}, {})
         self.w.send(d,password='x'); self.fake.include()

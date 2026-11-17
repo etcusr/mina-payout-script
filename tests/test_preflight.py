@@ -101,6 +101,37 @@ class PreflightTests(unittest.TestCase):
             with self.subTest(sql=sql):
                 self.fresh_archive(); self.db.conn.execute(sql)
                 with self.assertRaises(preflight.PreflightError): self.run_check(epoch=1)
+
+    def test_recent_missing_tip_with_matching_archive_ancestor_is_retryable_lag(self):
+        self.node['bestChain'].insert(0, {'stateHash':'h24','protocolState':{'consensusState':
+            {'blockchainLength':'24','epoch':'2'}}})
+        self.db.conn.execute('DELETE FROM blocks WHERE height=25')
+        with self.assertRaises(preflight.PreflightError) as caught: self.run_check(epoch=1)
+        self.assertEqual(type(caught.exception).__name__,'PreflightArchiveLagError')
+        self.assertIn('25',str(caught.exception)); self.assertIn('24',str(caught.exception))
+        self.assertTrue(self.db.closed)
+
+    def test_missing_tip_without_verified_recent_ancestor_is_not_retryable_lag(self):
+        for mutation in ('no_snapshot_ancestor','wrong_ancestor','orphaned_ancestor','old_archive','archive_ahead'):
+            with self.subTest(mutation=mutation):
+                self.fresh_archive(); self.node=copy.deepcopy(NODE)
+                if mutation!='no_snapshot_ancestor':
+                    self.node['bestChain'].insert(0, {'stateHash':'h24','protocolState':{'consensusState':
+                        {'blockchainLength':'24','epoch':'2'}}})
+                self.db.conn.execute('DELETE FROM blocks WHERE height=25')
+                if mutation=='wrong_ancestor': self.db.conn.execute("UPDATE blocks SET state_hash='other' WHERE height=24")
+                if mutation=='orphaned_ancestor': self.db.conn.execute("UPDATE blocks SET chain_status='orphaned' WHERE height=24")
+                if mutation=='old_archive': self.db.conn.execute('DELETE FROM blocks WHERE height>21')
+                if mutation=='archive_ahead': self.db.conn.execute("INSERT INTO blocks SELECT 99,'future',parent_id,parent_hash,26,protocol_version_id,chain_status,30,timestamp FROM blocks WHERE height=24")
+                with self.assertRaises(preflight.PreflightError) as caught: self.run_check(epoch=1)
+                self.assertNotEqual(type(caught.exception).__name__,'PreflightArchiveLagError')
+
+    def test_mismatched_or_orphaned_tip_remains_fatal(self):
+        for sql in ("UPDATE blocks SET height=26 WHERE state_hash='h25'", "UPDATE blocks SET chain_status='orphaned' WHERE state_hash='h25'"):
+            with self.subTest(sql=sql):
+                self.fresh_archive(); self.db.conn.execute(sql)
+                with self.assertRaises(preflight.PreflightError) as caught: self.run_check()
+                self.assertNotEqual(type(caught.exception).__name__,'PreflightArchiveLagError')
     def test_duplicate_canonical_and_stale_pending_fail(self):
         for status in ('canonical', 'pending'):
             with self.subTest(status=status):

@@ -71,6 +71,10 @@ class PayoutDisplay:
         self.progress_length = 0
         self.progress_key = None
         self.progress_at = 0
+        self.batch_proof_plan = None
+        self.last_batch_rows = {}
+        self.last_batch_depths = {}
+        self.batch_complete = False
 
     def finish(self):
         """Leave the cursor on a fresh line before messages, errors or prompts."""
@@ -109,19 +113,30 @@ class PayoutDisplay:
         if written: self.progress_at=now
 
     def plan(self, plan, intents=None, *, required_depth=None):
-        self.line('\nПлан выплат · эпоха '+str(plan['epoch']), 'cyan')
+        if plan.get('kind')=='withdrawal':
+            partial=plan.get('withdrawal_limit',{}).get('remaining_income_nano',0)>0
+            self.line('\n'+('ЧАСТИЧНЫЙ вывод дохода' if partial else 'Вывод дохода владельца'), 'yellow' if partial else 'cyan')
+        else:
+            self.line('\nПлан выплат · эпоха '+str(plan['epoch']), 'cyan')
         statuses = {i['payment_index']: i['status'] for i in (intents or ())}
         labels = {'submitted': 'отправлен', 'confirmed': 'подтверждён',
                   'failed': 'не выполнен', 'unknown': 'исход неизвестен', 'reserved': 'зарезервирован'}
         rows=[]
+        policy=plan.get('policy',{})
+        batch_size=policy['batch_size'] if policy.get('transport')=='zkapp_batch' else None
         for j, p in enumerate(plan['payments']):
             status = labels.get(statuses.get(j), 'не отправлен' if intents is not None else 'статус не загружен')
-            rows.append([j+1,account_link(p['recipient']),mina(p['amount_nano']),mina(p['fee_nano']),paint(status,status_tone(statuses.get(j)))])
+            rows.append([j+1]+([j//batch_size+1] if batch_size else [])+[account_link(p['recipient']),mina(p['amount_nano']),mina(p['fee_nano']),paint(status,status_tone(statuses.get(j)))])
         if rows:
-            self.line(table(rows,['№','Адрес получателя','Сумма MINA','Сеть MINA','Статус журнала'],colalign=('right','left','right','right','left')))
+            self.line(table(rows,['№']+(['Пакет'] if batch_size else [])+['Адрес получателя','Сумма MINA','Доля сети MINA' if batch_size else 'Сеть MINA','Статус журнала'],colalign=('right',)*(2 if batch_size else 1)+('left','right','right','left')))
         amount = sum(p['amount_nano'] for p in plan['payments'])
         fees = sum(p['fee_nano'] for p in plan['payments'])
         self.line(f"Итого: {len(plan['payments'])} платежей · {mina(amount)} MINA")
+        if batch_size:
+            self.line(f"Пакетов: {(len(rows)+batch_size-1)//batch_size} · до {batch_size} получателей в пакете")
+            for start in range(0,len(plan['payments']),batch_size):
+                group=plan['payments'][start:start+batch_size]
+                self.line(f"Пакет №{start//batch_size+1}: {len(group)} получателей · комиссия {mina(sum(p['fee_nano'] for p in group))} MINA")
         self.line(f'Сетевые комиссии: {mina(fees)} MINA · Всего: {mina(amount+fees)} MINA')
         self.line('Applied + блоков после включения: '+str(plan['min_confirmations'] if required_depth is None else required_depth))
 
@@ -158,16 +173,77 @@ class PayoutDisplay:
         elif event == 'income':
             summary=data['summary']
             self.line('\nДоход владельца · учёт в БД','cyan')
-            rows=[[r['epoch'],mina(r['validator_nano']),mina(r['retained_own_nano']),mina(r['payout_fees_nano'])] for r in summary['credits']]
+            rows=[[r['epoch'],mina(r['validator_nano']),mina(r['retained_own_nano']),mina(r['payout_fees_nano']),mina(r.get('delegator_fees_nano',0))] for r in summary['credits']]
             if rows:
-                self.line(table(rows,['Эпоха','Комиссия MINA','Свои на кошельке MINA','Расходы на выплаты MINA'],colalign=('right',)*4))
+                self.line(table(rows,['Эпоха','Комиссия MINA','Свои на кошельке MINA','Сеть за счёт владельца','Сеть за счёт делегаторов'],colalign=('right',)*5))
             self.line('Доход после расходов: '+mina(summary['earned_nano'])+' MINA')
             self.line('Уже выплачено своим адресам как делегаторам: '+mina(sum(r['own_paid_nano'] for r in summary['credits']))+' MINA (повторно в вывод не включается)')
             self.line('Уже выведено с комиссиями: '+mina(summary['withdrawn_with_fees_nano'])+' MINA')
             self.line('Зарезервировано с комиссиями: '+mina(summary['reserved_with_fees_nano'])+' MINA')
+            limit=data.get('withdrawal_limit')
+            if limit is not None:
+                rows=[[label,mina(limit[key])] for label,key in [
+                    ('Учтённый доход к выводу','requested_nano'),('Доступный баланс кошелька','liquid_nano'),
+                    ('Незавершённые переводы с комиссиями','commitments_nano'),('Резерв делегаторов','reserved_nano'),
+                    ('Свободно после резервов','available_nano'),('Вывод с комиссией','withdrawal_total_nano'),
+                    ('Останется учтённого дохода','remaining_income_nano')]]
+                self.line(table(rows,['Расчёт доступного вывода','MINA'],colalign=('left','right')))
+                if limit['remaining_income_nano']>0 and data['amount_nano']>0:
+                    self.line('Средств на полный вывод недостаточно. Предлагается ЧАСТИЧНЫЙ вывод; остаток дохода сохранится в БД.','yellow')
             self.line('Получателю: '+mina(data['amount_nano'])+' MINA · комиссия вывода: '+mina(data['fee_nano'])+' MINA','cyan')
         elif event == 'proofs':
             self.proofs(**data)
+        elif event == 'batch_proofs':
+            self.batch_proofs(**data)
+
+    def batch_proofs(self, plan, batches, required_depth=3):
+        """One transaction status per batch; recipients were shown in the plan."""
+        self.polling=True
+        key=(plan.get('epoch'),plan.get('operation_id'),plan.get('input_fingerprint'),required_depth,
+             tuple((p['recipient'],p['amount_nano'],p['fee_nano']) for p in plan['payments']))
+        if key!=self.batch_proof_plan:
+            self.finish(); self.last_batch_rows={}; self.last_batch_depths={}; self.batch_complete=False
+            self.batch_proof_plan=key
+        counts=dict(confirmed=0,included=0,pooled=0,failed=0,unknown=0,unsent=0,cancelled=0)
+        depths=[]; waiting=[]
+        for batch in batches:
+            index=batch['index']; proof=batch.get('proof') or {}; depth=proof.get('depth')
+            chain_status=proof.get('in_chain_status') or proof.get('status')
+            if chain_status in ('applied','failed') and depth is not None:
+                mature=depth>=required_depth
+                phase=('confirmed' if chain_status=='applied' else 'failed') if mature else 'included'
+                label=('Подтверждён' if mature else 'Applied') if chain_status=='applied' else ('Failed' if mature else 'Failed · ожидает глубины')
+                tone='green' if phase=='confirmed' else 'red' if chain_status=='failed' else 'yellow'
+                depths.append(depth)
+                if not mature: waiting.append((index,depth))
+            elif proof.get('in_pool'):
+                phase='pooled'; label='В пуле'; tone='yellow'
+            elif batch['status'] in ('planned','prepared','cancelled','failed'):
+                phase={'planned':'unsent','prepared':'unsent','cancelled':'cancelled','failed':'failed'}[batch['status']]
+                label={'planned':'Не отправлен','prepared':'Подготовлен','cancelled':'Отменён','failed':'Failed'}[batch['status']]
+                tone='red' if phase=='failed' else 'yellow'
+            else:
+                phase='unknown'; label='исход неизвестен'; tone='red'
+            counts[phase]+=1
+            state=(phase,label,batch.get('nonce'),batch.get('tx_hash'),proof.get('height'),proof.get('block_hash'))
+            if self.last_batch_rows.get(index)!=state:
+                self.line(f"Пакет №{index+1}: {label} · nonce={batch.get('nonce') if batch.get('nonce') is not None else '—'} · tx={batch.get('tx_hash') or '—'} · блок {proof.get('height','—')} · подтверждения {depth if depth is not None else '—'}/{required_depth}",tone)
+                if phase=='unknown': self.line('Исход неизвестен: повторная отправка запрещена; продолжаю сверку.','red')
+            previous=self.last_batch_depths.get(index)
+            if previous is not None and depth is not None and depth<previous:
+                self.line(f'Глубина снизилась: пакет №{index+1}, {previous} → {depth}. Проверяю свежую цепочку.','yellow')
+            self.last_batch_rows[index]=state; self.last_batch_depths[index]=depth
+        total=len(batches); complete=counts['confirmed']==total
+        summary=f"Подтверждено пакетов {counts['confirmed']}/{total} · в пуле {counts['pooled']}"
+        if waiting:
+            index,depth=min(waiting,key=lambda item:item[1])
+            summary+=f' · пакет №{index+1}: {depth}/{required_depth}'
+        elif depths: summary+=f' · подтверждения {min(depths)}/{required_depth}'
+        for phase,label in [('unknown','исход неизвестен'),('unsent','не отправлены'),('failed','Failed'),('cancelled','отменены')]:
+            if counts[phase]: summary+=f' · {label}: {counts[phase]}'
+        if not complete or not self.batch_complete or summary!=self.progress_key:
+            self.progress(summary,'red' if counts['failed'] or counts['unknown'] else 'green' if complete else 'yellow',complete=complete)
+        self.batch_complete=complete
 
     def proofs(self, plan, intents, chain, pool, required_depth=None):
         from payout_workflow import same_payment

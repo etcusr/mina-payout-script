@@ -110,8 +110,12 @@ def calculate_epoch(workflow,epoch,*,preview=False,provider=live_inputs):
         if old and not preview:
             digest,plan=old[0]
             workflow._check_plan(plan,health)
+            if plan.get('policy',{}).get('transport')=='zkapp_batch':
+                from payout_batch import EpochBatchAdapter
+                wallet_health=EpochBatchAdapter(workflow,plan,digest).health()
+            else:wallet_health=workflow.health(wallet=True)
             return {'epoch':epoch,'plan':digest,'calculation':plan['calculation'],'preview':False,'existing':True,
-                    'wallet':wallet_summary(workflow,workflow.health(wallet=True)),
+                    'wallet':wallet_summary(workflow,wallet_health),
                     'block_report':live_block_report(workflow,epoch,health),
                     'reward_blocks':plan['inputs'].get('blocks',[]),'staking':plan['inputs'].get('stakes',[]),
                     'payment_status':plan_status(store,digest)}
@@ -182,7 +186,9 @@ def report(result):
     rates=[('обычная','VALIDATOR_FEE'),('supercharged','VALIDATOR_FEE_SP'),('Foundation','VALIDATOR_FEE_FOUNDATION'),('O(1)Labs','VALIDATOR_FEE_O1LABS')]
     print('  Комиссия валидатора: '+', '.join(name+' '+format(Decimal(policy[key])*100,'f')+'%' for name,key in rates if key in policy))
     print(paint('\nВыплаты делегаторам · все суммы в MINA','cyan'))
-    print('Начислено + Долг до = К выплате + Остаток после. Остаток переносится на будущие выплаты.')
+    delegate_funded=policy.get('network_fee_source','validator')=='delegators'
+    print(('Начислено + Долг до = К выплате + Сеть + Остаток после.' if delegate_funded else
+           'Начислено + Долг до = К выплате + Остаток после.')+' Остаток переносится на будущие выплаты.')
     labels={'submitted':'отправлен','confirmed':'подтверждён','failed':'не выполнен',
             'unknown':'исход неизвестен','reserved':'зарезервирован'}
     rows=[]
@@ -191,12 +197,23 @@ def report(result):
         send=c['net_nano'].get(a,0); after=c['carry_after_nano'].get(a,0)
         label=labels.get(status.get('by_recipient',{}).get(a))
         if label is None:
-            label='к отправке' if send else 'ниже минимума' if after>0 and after<policy.get('minimum_nano',0) else 'нет выплаты'
-        rows.append([account_link(a),mina(gross),mina(before),mina(send),mina(after),paint(label,status_tone(status.get('by_recipient',{}).get(a)))])
-    print(table(rows,headers=['Адрес получателя','Начислено','Долг до','К выплате','Остаток после','Статус'],colalign=('left','right','right','right','right','left')) if rows else '  Получателей нет.')
-    total=sum(c['net_nano'].values()); fees=len(c['net_nano'])*policy['fee_nano']
+            label='к отправке' if send else 'ниже минимума после комиссии' if delegate_funded and after>0 else 'ниже минимума' if after>0 and after<policy.get('minimum_nano',0) else 'нет выплаты'
+        values=[account_link(a),mina(gross),mina(before),mina(send)]
+        if delegate_funded: values.append(mina(c.get('delegator_fees_nano',{}).get(a,0)))
+        rows.append(values+[mina(after),paint(label,status_tone(status.get('by_recipient',{}).get(a)))])
+    headers=['Адрес получателя','Начислено','Долг до','К выплате']+(['Сеть'] if delegate_funded else [])+['Остаток после','Статус']
+    print(table(rows,headers=headers,colalign=('left',)+('right',)*(len(headers)-2)+('left',)) if rows else '  Получателей нет.')
+    batch=policy.get('transport')=='zkapp_batch'
+    total=sum(c['net_nano'].values())
+    fees=sum(c['payment_fees_nano'].values()) if batch else len(c['net_nano'])*policy['fee_nano']
     print(f"\nПо плану: {len(c['net_nano'])} платежей · {mina(total)} MINA")
+    if batch:
+        size=policy['batch_size']
+        print(f"Пакетов: {(len(c['net_nano'])+size-1)//size} · до {size} получателей в пакете · комиссия пакета {mina(policy['fee_nano'])} MINA")
     print(f"Сетевые комиссии: {mina(fees)} MINA · Всего с комиссиями: {mina(total+fees)} MINA")
+    if delegate_funded:
+        print('Комиссия пакета разделена между его получателями и вычтена после комиссии валидатора.' if batch else
+              'Сетевая комиссия каждой отправки вычтена из награды её получателя после комиссии валидатора.')
     print('Минимальная выплата: '+mina(policy.get('minimum_nano',0))+' MINA')
     print('Плановый остаток долга после успешных выплат: '+mina(sum(max(0,n) for n in c['carry_after_nano'].values()))+' MINA')
     print('При неуспешном платеже его сумма остаётся долгом; окончательный остаток определяет сверка.')

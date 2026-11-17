@@ -1,0 +1,9 @@
+{
+  "name": "mina-payout-batch-lab",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": { "node": ">=22.19.5" },
+  "scripts": { "test": "node --test --test-concurrency=1 test/*.test.mjs" },
+  "dependencies": { "o1js": "3.1.0" }
+}

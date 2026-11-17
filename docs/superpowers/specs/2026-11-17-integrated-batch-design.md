@@ -1,0 +1,13 @@
+# Integrated epoch batch payouts
+
+User request: integrate the mainnet-tested batch into ordinary balance_mina/mina_pay for the next epoch; preserve existing payout history and test safety end to end. Existing automatic workflow and no repeated implementation approvals are retained.
+
+Selected approach: immutable ordinary epoch plan retains flat recipients and per-recipient allocated fees. A separate batch plan is deterministically linked by ordinary plan digest. Batch journal owns signed intents/nonces, while read-only projected recipient receipts let existing carry settlement and owner-income accounting operate. Old plans without transport remain ordinary payments. Compared with migrating old intents to many-recipient rows, this preserves historical journal meaning and avoids nonce uniqueness conflicts. Compared with an unrelated standalone test operation, linkage allows genuine delegator settlement without charging owner income twice.
+
+New calculations choose PAYOUT_TRANSPORT=zkapp_batch, PAYOUT_BATCH_SIZE=30 and PAYOUT_BATCH_FEE_NANO=6000001 in private config after validation; library default remains payment for compatibility. Settings freeze in policy. Batches are contiguous sorted recipients; fee equally divided with integer remainder to earliest sorted addresses. Remove candidates unable to meet positive/minimum net after their fee share and regroup until stable. Carry for excluded candidates remains owed. Validator-funded mode retains existing semantics.
+
+No reserve advance for epoch batches. The test exception remains limited to its old standalone immutable plan. No automatic ordinary fallback or resend. Claimed unknown transaction remains reserved; confirmed Failed charges fee only and cancels never-signed suffix, returning all unpaid reward to carry. Mainnet accounts must already exist.
+
+Main flow retains aliases. One password prompt and immutable plan review, then sequential batches with Applied+3 between them. Restart reconciles existing batch before continuing never-signed suffix, with a new confirmation/password when needed. Previous epoch proofs require 15. Ordinary payouts, withdrawals and unrelated standalone batches stay blocked by uncertain operations. Shared wallet lock across all send/settle operations. Funding uses delegator payout budget (not owner's discretionary income), protects resulting carry and all other pending commitments. Every prior proof and current plan's reward ancestry rechecked after password wait.
+
+No on-chain payments, releases or production accounting changes in implementation. Local config may enable future calculations only after tests and privacy checks. UI retains full linked addresses, per-recipient sums, per-batch nonce/hash/depth and owner summary.

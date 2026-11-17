@@ -19,6 +19,7 @@ class CalculationTests(unittest.TestCase):
     def setUp(self):
         self.assertIsNotNone(calc, 'exact payout calculation module required')
         self.cfg={'SEND_FROM_ADDRESS':W,'VALIDATOR_ADDRESS':W,'VALIDATOR_FEE':'0.1','VALIDATOR_FEE_SP':'0.2','VALIDATOR_FEE_FOUNDATION':'0.3','VALIDATOR_FEE_O1LABS':'0.4','DEFAULT_TX_FEE':1,'MINIMUM_PAYOUT':'0.000000010','EXCLUDE_FROM_PAYOUTS':[]}
+        self.cfg['PAYOUT_NETWORK_FEE_SOURCE']='validator'  # Legacy allocation regressions.
     def test_floor_allocations_conserve_reward_and_carry_dust(self):
         r=calc.calculate(self.cfg,3,8,[{'public_key':A,'balance':'1','timing':None},{'public_key':B,'balance':'2','timing':None}], [{'reward_nano':101,'snark_nano':0,'fees_nano':0,'slot':1,'winner':A}], base_coinbase_nano=101,carry={A:-25,B:3})
         self.assertEqual(r['gross_nano'],{A:30,B:60})

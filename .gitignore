@@ -60,5 +60,9 @@ src/
 # Private runtime state and task snapshots
 .payout-state/
 
+# Isolated zkApp batch runtime/dependencies (never production accounting)
+batch-pay/node_modules/
+batch-pay/.state/
+
 # Local operational plan contains private node and historical payout context.
 docs/superpowers/plans/2026-11-05-payout-hardening.md

@@ -54,7 +54,14 @@ PREVIOUS_PAYOUT_CONFIRMATIONS_NUM: 15
 AUTO_SETTLE_WAIT_SECONDS: 3600
 
 # Rewards below this many MINA carry forward after verified reconciliation.
+# The recipient amount AFTER its network fee must reach this threshold.
 MINIMUM_PAYOUT: 0.1
+
+# New plans: each actual recipient funds its network fee from its rewards,
+# after validator commission. Unsent dust pays no fee. Frozen plans keep
+# their original policy; legacy plans without this field charge the validator.
+# Set validator explicitly to use the old policy for new plans too.
+PAYOUT_NETWORK_FEE_SOURCE: delegators
 
 # Own addresses that stake here but should not be sent a payout. The coinbase
 # already sits on the payout wallet, so paying it to itself moves nothing and
@@ -108,6 +115,15 @@ SEND_FROM_ADDRESS: B62q...
 
 # Transaction fee in nanomina. 10000000 = 0.01 MINA
 DEFAULT_TX_FEE: 10000000
+
+# Transport for NEW epoch plans. Existing plans keep their frozen transport;
+# plans without transport remain ordinary payments. Keep payment by default.
+# Enable zkapp_batch in your private config.yml only after local tests pass.
+PAYOUT_TRANSPORT: payment
+# zkapp_batch: 1-30 recipients per transaction; fee is for the WHOLE batch.
+# With delegator funding, its fee is divided between the actual recipients.
+PAYOUT_BATCH_SIZE: 30
+PAYOUT_BATCH_FEE_NANO: 6000001
 
 # Bounded confirmation wait in seconds. Timeout leaves a resumable pending
 # journal entry; it NEVER creates a file authorizing repayment.

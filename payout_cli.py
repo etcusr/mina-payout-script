@@ -56,7 +56,7 @@ def _parser():
             p.add_argument('--accept-pending',action='store_true',help='unsupported: absence cannot prove failure')
             p.add_argument('--wait',nargs='?',type=int,const=30,default=0,metavar='MINUTES')
         if name=='withdraw':
-            p.add_argument('--amount',help='exact MINA decimal string; omitted: recorded unpaid owner income minus withdrawal fee')
+            p.add_argument('--amount',help='exact MINA decimal string; omitted: propose unpaid owner income limited by liquid funds after reserves and fee')
             p.add_argument('--to'); p.add_argument('--operation-id',help='reuse the printed UUID for a withdrawal resume')
             p.add_argument('--new-operation',action='store_true',help='explicitly start another withdrawal, including the same amount previously settled')
         if name=='backup': p.add_argument('--destination',required=True)
@@ -74,7 +74,12 @@ def _confirmation(yes, *, show_plan=True, required_depth=None):
             PayoutDisplay().plan(plan,required_depth=required_depth)
         print(paint('Подтверждение сохранённого плана выплат','cyan'))
         if plan.get('operation_id'): print('Withdrawal operation ID: '+plan['operation_id'])
-        if not yes and input('Подтвердить отправку оставшихся платежей? [y/N]: ').strip().lower()!='y': raise StateError('Cancelled before wallet unlock')
+        partial=plan.get('kind')=='withdrawal' and plan.get('withdrawal_limit',{}).get('remaining_income_nano',0)>0
+        question='Подтвердить ЧАСТИЧНЫЙ вывод указанной суммы? [y/N]: ' if partial else 'Подтвердить отправку оставшихся платежей? [y/N]: '
+        if not yes and input(question).strip().lower()!='y': raise StateError('Cancelled before wallet unlock')
+        if plan.get('policy',{}).get('transport')=='zkapp_batch':
+            from batch_mainnet import read_password
+            return read_password()
         return getpass.getpass('Пароль кошелька: ')
     return confirm
 
@@ -129,9 +134,19 @@ def _complete_accounting(workflow, digest, seconds, resume_command):
     from payout_workflow import PendingPayments
     deadline=time.monotonic()+max(0,int(seconds))
     disconnected=False
+    archive_waiting=False
     while True:
         try:
             settlement=workflow.reconcile(digest,commit=True)
+        except preflight.PreflightArchiveLagError as error:
+            finish_progress(workflow)
+            if not archive_waiting:
+                print(paint('Архив ещё догоняет свежие блоки. '+str(error)+' Повторяется только сверка, без повторной отправки.','yellow'),flush=True)
+            archive_waiting=True
+            remaining=deadline-time.monotonic()
+            if remaining<=0:
+                return {'plan':digest,'settled':False,'resume':resume_command,'pending_reason':'archive_lag'}
+            time.sleep(min(15,remaining))
         except preflight.PreflightConnectionError:
             finish_progress(workflow)
             disconnected=True
@@ -146,6 +161,10 @@ def _complete_accounting(workflow, digest, seconds, resume_command):
                 print(paint('Туннель пока недоступен; повторю проверку связи в пределах времени ожидания.','yellow'),flush=True)
             time.sleep(min(15,max(0,deadline-time.monotonic())))
         except PendingPayments:
+            if archive_waiting:
+                finish_progress(workflow)
+                print(paint('Архив догнал валидатор, свежие проверки пройдены. Ожидаю подтверждения перевода.','green'),flush=True)
+                archive_waiting=False
             if disconnected:
                 finish_progress(workflow)
                 print(paint('Связь восстановлена, свежие проверки пройдены. Ожидаю подтверждения перевода.','green'),flush=True)
@@ -157,6 +176,9 @@ def _complete_accounting(workflow, digest, seconds, resume_command):
                 print('Ожидаю подтверждения в цепочке; после них учёт завершится автоматически.',flush=True)
             time.sleep(min(15,remaining))
         else:
+            if archive_waiting:
+                finish_progress(workflow)
+                print(paint('Архив догнал валидатор, подтверждение проверено по свежей цепочке.','green'),flush=True)
             if disconnected:
                 finish_progress(workflow)
                 print(paint('Связь восстановлена, подтверждение проверено по свежей цепочке.','green'),flush=True)
@@ -177,7 +199,12 @@ def _complete_accounting(workflow, digest, seconds, resume_command):
 
 def completion_report(result):
     if result.get('nothing_to_withdraw'):
-        print(paint('Новых средств для вывода нет: учтённый доход уже выведен или зарезервирован.','green'))
+        if result.get('nothing_to_withdraw_reason')=='liquidity':
+            print(paint('Сейчас нет доступной суммы сверх комиссии и резервов. Невыведенный доход сохранён в БД.','yellow'))
+        elif result.get('owner_income',{}).get('available_nano',0)>0:
+            print(paint('Учтённого дохода пока недостаточно для перевода с комиссией; остаток сохранён в БД.','yellow'))
+        else:
+            print(paint('Новых средств для вывода нет: учтённый доход уже выведен или зарезервирован.','green'))
         if result.get('owner_income') is not None: income_totals(result['owner_income'])
         return
     if result['settled']:
@@ -196,6 +223,8 @@ def completion_report(result):
     else:
         message=('Операция ещё не завершена: связь недоступна, текущие подтверждения неизвестны. Учёт не закрыт.'
                  if result.get('pending_reason')=='connectivity' else
+                 'Операция ещё не завершена: архив не догнал валидатор, текущие подтверждения не проверены. Учёт не закрыт.'
+                 if result.get('pending_reason')=='archive_lag' else
                  'Операция ещё не завершена: подтверждений недостаточно. Учёт не закрыт.')
         print(paint(message,'yellow'))
         print('Для продолжения повторите: '+result['resume'])
@@ -294,12 +323,13 @@ def main(argv=None):
                         if display: display.plan(plan,workflow.store().list_intents(plan_digest=digest),required_depth=workflow.tx_depth(plan))
                         automatic_backup(workflow,'before-'+digest[:12])
                         if display: display.line('Резервная копия перед отправкой: OK','green')
-                        if len(workflow.store().list_intents(plan_digest=digest))<len(plan['payments']):
+                        if workflow.needs_send(digest):
                             workflow.send(digest,confirm=_confirmation(args.yes,show_plan=display is None,required_depth=workflow.tx_depth(plan)))
                         resume=continuation_command(args,workflow,['mina_pay','--plan',digest] if args.plan else ['mina_pay','--epoch',str(args.epoch)])
                         seconds=args.wait_seconds if args.wait_seconds is not None else config.get('AUTO_SETTLE_WAIT_SECONDS',3600)
                         if display: display.line('\nПодтверждения и сверка — проверяю свежую цепочку…','cyan')
-                        result=complete_accounting(workflow,digest,seconds,resume)
+                        try:result=complete_accounting(workflow,digest,seconds,resume)
+                        finally:getattr(workflow,'_batch_passwords',{}).pop(digest,None)
                         exit_code=0 if result['settled'] else 2
                     else:
                         result=workflow.send(digest,dry_run=args.dry_run,confirm=_confirmation(args.yes,show_plan=display is None,required_depth=workflow.tx_depth(workflow.store().get_plan(digest))))

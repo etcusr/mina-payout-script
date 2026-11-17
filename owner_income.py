@@ -72,6 +72,10 @@ def summary(store,wallet,network):
         if len(intents)==len(plan['payments']) and all(i['status']=='confirmed' for i in intents): spent+=value
         elif intents and all(i['status']=='failed' for i in intents): pass
         else: reserved+=value
+    from batch_accounting import readonly_snapshot
+    batches=readonly_snapshot(store.root,wallet,network,owner_only=True)
+    spent+=batches['spent_nano']
+    reserved+=batches['reserved_nano']
     total=sum(r['validator_nano']+r['retained_own_nano']-r['payout_fees_nano'] for r in credits)
     return {'credits':credits,'earned_nano':total,'withdrawn_with_fees_nano':spent,
             'reserved_with_fees_nano':reserved,'available_nano':total-spent-reserved,
@@ -84,7 +88,11 @@ def check_external_spends(store,wallet,network,health,account):
     current=health['account']['nonce']
     if current<baseline: raise StateError('Nonce ниже начала учёта доходов; проверьте реорганизацию цепочки.')
     intents={i['nonce']:i for i in store.list_intents(wallet,network=network) if baseline<=i['nonce']<current}
-    if len(intents)!=current-baseline or any(i['status']=='failed' for i in intents.values()):
+    from batch_accounting import readonly_snapshot
+    batch_nonces={n for n in readonly_snapshot(store.root,wallet,network)['known_nonces'] if baseline<=n<current}
+    if batch_nonces & intents.keys():
+        raise StateError('Nonce одновременно занят обычным и пакетным платежом; вывод остановлен.')
+    if len(intents.keys() | batch_nonces)!=current-baseline or any(i['status']=='failed' for i in intents.values()):
         raise StateError('После начала учёта найден неучтённый исходящий перевод; автоматический вывод остановлен.')
 
 
@@ -108,6 +116,14 @@ def own_addresses(config):
 
 def record_payout(store,digest,plan,intents,config,nonce):
     if plan.get('kind','payout')!='payout': return
+    from payout_batch_state import is_batch_plan
+    batch = is_batch_plan(plan)
+    if batch:
+        # Fees, outcomes and cancelled suffix must come from validated journal
+        # projections, including on the settlement/credit crash boundary.
+        if _canonical(plan) != _canonical(store.get_plan(digest)):
+            raise StateError('batch income plan differs from immutable payout')
+        intents = store.list_intents(plan_digest=digest)
     c=plan.get('calculation',{})
     if not all(k in c for k in ('validator_nano','excluded_nano','total_reward_nano')):
         return  # Compatibility fixtures/older incomplete plans need explicit import.
@@ -122,12 +138,17 @@ def record_payout(store,digest,plan,intents,config,nonce):
     if not by_address and c['excluded_nano'] and not set(c['policy']['exclusions'])<=own:
         raise StateError('cannot attribute excluded income to configured own addresses')
     retained={a:n for a,n in by_address.items() if a in own}
+    fee_source=plan.get('policy',{}).get('network_fee_source','validator')
+    if fee_source not in ('delegators','validator'): raise StateError('unknown payout network fee source')
+    paid_fees=sum(i['payment']['fee_nano'] for i in intents
+                  if i['status']=='confirmed' or (batch and i['status']=='failed'))
     record={'wallet':plan['wallet'],'network':plan['network'],'era':plan['era'],'epoch':plan['epoch'],
             'validator_nano':c['validator_nano'],
             'retained_own_nano':sum(retained.values()) if by_address else c['excluded_nano'],
             'own_retained_by_address':retained,
             'own_paid_nano':sum(i['payment']['amount_nano'] for i in intents if i['status']=='confirmed' and i['payment']['recipient'] in own),
-            'payout_fees_nano':sum(i['payment']['fee_nano'] for i in intents if i['status']=='confirmed'),
+            'payout_fees_nano':paid_fees if fee_source=='validator' else 0,
+            'delegator_fees_nano':paid_fees if fee_source=='delegators' else 0,
             'source':{'kind':'settled_plan','plan_digest':digest}}
     initialize_account(store,plan['wallet'],plan['network'],nonce)
     record_credit(store,record)

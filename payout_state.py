@@ -169,6 +169,8 @@ def _validate_plan(plan):
             for item in value:
                 reject_float(item)
     reject_float(plan)
+    from payout_batch_state import validate_batch_policy
+    validate_batch_policy(plan)
     return _canonical(plan)
 
 
@@ -195,12 +197,16 @@ CREATE TABLE historical (digest TEXT PRIMARY KEY, source_name TEXT NOT NULL,
 
 class StateStore:
     """Journal opener. create=True authorizes first initialization only."""
-    def __init__(self, root, *, create=False):
+    def __init__(self, root, *, create=False, readonly=False):
         self.root = Path(root)
+        self.readonly = readonly
+        if readonly and create:
+            raise StateError('read-only journal cannot be initialized')
         self.path = self.root / 'journal.sqlite3'
         if not self.path.exists() and not create:
             raise StateError('journal is missing; initialize explicitly or restore a verified backup')
-        _private_directory(self.root)
+        if not readonly:
+            _private_directory(self.root)
         fresh = False
         if not self.path.exists():
             try:
@@ -211,7 +217,8 @@ class StateStore:
                 pass
         if self.path.is_symlink():
             raise StateError('journal must not be a symbolic link')
-        os.chmod(self.path, 0o600)
+        if not readonly:
+            os.chmod(self.path, 0o600)
         try:
             with self._connection() as connection:
                 if fresh:
@@ -225,6 +232,8 @@ class StateStore:
                 for table in ('plans', 'accounting_runs', 'intents', 'events', 'historical', 'settlements'):
                     connection.execute('SELECT * FROM ' + table + ' LIMIT 0')
                 if version[0][0]==2:
+                    if readonly:
+                        raise StateError('journal version requires an explicit ordinary-workflow upgrade')
                     from owner_income import TABLES
                     connection.execute('BEGIN IMMEDIATE')
                     for statement in TABLES: connection.execute(statement)
@@ -236,12 +245,15 @@ class StateStore:
 
     @contextlib.contextmanager
     def _connection(self):
-        connection = sqlite3.connect('file:' + str(self.path.resolve()) + '?mode=rw', uri=True, timeout=10)
+        connection = sqlite3.connect(self.path.resolve().as_uri() + ('?mode=ro' if self.readonly else '?mode=rw'), uri=True, timeout=10)
         connection.row_factory = sqlite3.Row
         try:
             connection.execute('PRAGMA foreign_keys=ON')
-            connection.execute('PRAGMA synchronous=FULL')
-            connection.execute('PRAGMA journal_mode=DELETE')
+            if self.readonly:
+                connection.execute('PRAGMA query_only=ON')
+            else:
+                connection.execute('PRAGMA synchronous=FULL')
+                connection.execute('PRAGMA journal_mode=DELETE')
             with connection:
                 yield connection
         finally:
@@ -293,6 +305,76 @@ class StateStore:
             row = connection.execute('SELECT balances FROM settlements WHERE plan_digest=?', (digest,)).fetchone()
         return json.loads(row[0]) if row else None
 
+    def _batch_link(self, connection, digest, plan):
+        source = 'batch_link:' + digest
+        rows = connection.execute('SELECT digest,source_name,payload,metadata FROM historical WHERE source_name=? OR metadata LIKE ?',
+                                  (source, '%batch_link%')).fetchall()
+        matches = []
+        for row in rows:
+            try:
+                metadata = json.loads(row['metadata'])
+            except (ValueError, TypeError) as exc:
+                raise StateError('invalid batch link metadata') from exc
+            if not isinstance(metadata, dict):
+                raise StateError('invalid batch link metadata')
+            if row['source_name'] == source or (metadata.get('kind') == 'batch_link' and metadata.get('plan_digest') == digest):
+                matches.append((row, metadata))
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise StateError('duplicate batch link markers')
+        row, metadata = matches[0]
+        if (row['source_name'] != source or metadata != {'kind': 'batch_link', 'plan_digest': digest}
+                or _hash(row['payload'].encode()) != row['digest']):
+            raise StateError('batch link marker checksum or identity mismatch')
+        try:
+            marker = json.loads(row['payload'])
+            nonce = _integer(marker.get('initial_nonce'), 'batch initial nonce')
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise StateError('invalid batch link marker') from exc
+        from payout_batch_state import linked_digest
+        expected = {'payout_plan': digest, 'batch_plan': linked_digest(plan, digest),
+                    'initial_nonce': nonce, **{key: plan[key] for key in ('wallet', 'network', 'era')}}
+        if nonce >= 2**32 or _canonical(marker) != _canonical(expected):
+            raise StateError('batch link marker differs from immutable payout plan')
+        return marker
+
+    def batch_link(self, digest):
+        """Read the immutable cross-journal marker without reading batch state."""
+        plan = self.get_plan(digest)
+        with self._connection() as connection:
+            return self._batch_link(connection, digest, plan)
+
+    def bind_batch(self, digest, batch_digest, initial_nonce):
+        """Record batch ownership before signing; a missing owned journal is fatal."""
+        plan = self.get_plan(digest)
+        from payout_batch_state import linked_digest, batch_plan
+        if batch_digest != linked_digest(plan, digest):
+            raise StateError('batch link does not match immutable payout plan')
+        _integer(initial_nonce, 'batch initial nonce')
+        if initial_nonce >= 2**32:
+            raise StateError('batch initial nonce exceeds UInt32')
+        marker = {'payout_plan': digest, 'batch_plan': batch_digest, 'initial_nonce': initial_nonce,
+                  **{key: plan[key] for key in ('wallet', 'network', 'era')}}
+        with self._connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            old = self._batch_link(connection, digest, plan)
+            if old is not None:
+                if _canonical(old) != _canonical(marker):
+                    raise StateError('batch link marker is immutable')
+                return old
+            from batch_accounting import BatchStore
+            batches = BatchStore(self.root, create=False)
+            if batches.get_plan(batch_digest) != batch_plan(plan, digest):
+                raise StateError('batch journal differs from immutable payout')
+            if any(row['status'] != 'planned' for row in batches.rows(batch_digest)):
+                raise StateError('cannot bind a batch journal after signing has started')
+            payload = _canonical(marker)
+            metadata = _canonical({'kind': 'batch_link', 'plan_digest': digest})
+            connection.execute('INSERT INTO historical VALUES (?,?,?,?,?)',
+                               (_hash(payload.encode()), 'batch_link:' + digest, payload, metadata, _now()))
+        return marker
+
     def settle(self, digest, balances):
         """Persist resulting signed carry; caller proves fresh chain under wallet lock."""
         if not isinstance(balances, dict) or any(not isinstance(a, str) or not a or type(v) is not int for a,v in balances.items()):
@@ -329,6 +411,9 @@ class StateStore:
 
     def reserve_intent(self, plan_digest, payment_index, nonce):
         plan = self.get_plan(plan_digest)
+        from payout_batch_state import is_batch_plan
+        if is_batch_plan(plan):
+            raise StateError('batch payout intents belong to the linked batch journal')
         _integer(payment_index, 'payment_index')
         _integer(nonce, 'nonce')
         if payment_index >= len(plan['payments']):
@@ -372,6 +457,14 @@ class StateStore:
         return result
 
     def list_intents(self, wallet=None, plan_digest=None, network=None):
+        if plan_digest is not None:
+            from payout_batch_state import is_batch_plan, projected_intents
+            plan = self.get_plan(plan_digest)
+            if is_batch_plan(plan):
+                if ((wallet is not None and wallet != plan['wallet']) or
+                        (network is not None and network != plan['network'])):
+                    return []
+                return projected_intents(self, plan_digest, plan)
         conditions, args = [], []
         if wallet is not None:
             conditions.append('wallet=?')
@@ -515,9 +608,15 @@ class StateStore:
         destination = Path(destination)
         if destination.exists():
             raise FileExistsError(destination)
+        from batch_accounting import BatchStore, FILENAME
+        batch_path = self.root / FILENAME
+        batch_store = BatchStore(self.root, create=False) if batch_path.exists() or batch_path.is_symlink() else None
+        if batch_store:
+            for wallet, network in {(p['wallet'], p['network']) for _, p in batch_store.list_plans()}:
+                batch_store.snapshot(wallet, network)
         files = [Path(path) for path in extra_files]
         names = [path.name for path in files]
-        if len(set(names)) != len(names) or any(name in ('journal.sqlite3', 'manifest.json') for name in names):
+        if len(set(names)) != len(names) or any(name in ('journal.sqlite3', 'manifest.json', FILENAME) for name in names):
             raise StateError('backup filenames must be unique')
         if any(not path.is_file() or path.is_symlink() for path in files):
             raise StateError('backup inputs must be regular files')
@@ -529,6 +628,13 @@ class StateStore:
                     source.backup(target)
                 finally:
                     target.close()
+            if batch_store:
+                with batch_store._connection() as source:
+                    target = sqlite3.connect(str(destination / FILENAME))
+                    try:
+                        source.backup(target)
+                    finally:
+                        target.close()
             for path in files:
                 shutil.copyfile(path, destination / path.name)
             manifest = {'version': 1, 'created': _now(), 'files': {}}
@@ -577,6 +683,11 @@ def verified_restore(backup, destination):
                 handle.flush()
                 os.fsync(handle.fileno())
         StateStore(destination)
+        from batch_accounting import BatchStore, FILENAME
+        if (destination / FILENAME).exists():
+            batches = BatchStore(destination, create=False)
+            for wallet, network in {(p['wallet'], p['network']) for _, p in batches.list_plans()}:
+                batches.snapshot(wallet, network)
         _sync_directory(destination)
     except BaseException:
         shutil.rmtree(destination)

@@ -92,6 +92,74 @@ class OwnerIncomeTests(unittest.TestCase):
         self.assertEqual(before,(self.root/'.payout-state/journal.sqlite3').read_bytes())
         self.assertNotIn('unlock',self.fake.calls)
 
+    def test_insufficient_real_balance_explains_shortfall_without_reserving_income(self):
+        self.credit(commission=25661641075,own=0,fees=0)
+        self.fake.liquid=26457556825; self.cfg['DEFAULT_TX_FEE']=6000001
+        path=self.root/'.payout-state/journal.sqlite3'; before=path.read_bytes()
+        with patch.object(self.w,'carry',return_value={A:1130513590}):
+            with self.assertRaises(StateError) as caught:
+                self.w.withdraw(A,25655641074,password='test',reuse_existing=True)
+        message=str(caught.exception)
+        for value in ('26.457556825','1.130513590','25.327043235','25.661641075','0.334597840'):
+            self.assertIn(value,message)
+        self.assertIn('Недостаёт',message)
+        self.assertEqual(before,path.read_bytes())
+        self.assertNotIn('unlock',self.fake.calls)
+        self.assertFalse(any(isinstance(x,tuple) for x in self.fake.calls))
+
+    def test_auto_partial_withdraw_preserves_credit_and_never_subtracts_reserve_twice(self):
+        import owner_income
+        self.credit(commission=25661641075,own=0,fees=0)
+        self.fake.liquid=26457556825; self.cfg['DEFAULT_TX_FEE']=6000001
+        with patch.object(self.w,'carry',return_value={A:1130513590}):
+            result=self.w.withdraw(A,None,password='test',reuse_existing=True)
+            plan=self.w.store().get_plan(result['plan'])
+            self.assertEqual(plan['payments'][0]['amount_nano'],25321043234)
+            self.assertEqual(plan['withdrawal_limit']['remaining_income_nano'],334597840)
+            self.assertEqual(plan['withdrawal_limit']['reserved_nano'],1130513590)
+            self.fake.include(3)
+            self.w.reconcile(result['plan'],commit=True)
+        income=owner_income.summary(self.w.store(),W,'chain')
+        self.assertEqual(income['available_nano'],334597840)
+        self.assertEqual(income['withdrawn_with_fees_nano'],25327043235)
+
+    def test_auto_withdraw_does_not_subtract_reserves_from_income_when_wallet_has_enough(self):
+        self.credit()
+        with patch.object(self.w,'carry',return_value={A:100}):
+            result=self.w.withdraw(A,None,dry_run=True,reuse_existing=True)
+        self.assertEqual(result['amount_nano'],117)
+
+    def test_fee_only_liquidity_leaves_income_untouched_and_creates_no_plan(self):
+        self.credit(); self.fake.liquid=101
+        path=self.root/'.payout-state/journal.sqlite3'; before=path.read_bytes()
+        with patch.object(self.w,'carry',return_value={A:100}):
+            result=self.w.withdraw(A,None,password='test',reuse_existing=True)
+        self.assertTrue(result['nothing_to_withdraw'])
+        self.assertEqual(result['nothing_to_withdraw_reason'],'liquidity')
+        self.assertEqual(before,path.read_bytes())
+        self.assertNotIn('unlock',self.fake.calls)
+
+    def test_pending_partial_keeps_original_amount_after_balance_changes(self):
+        self.credit(); self.fake.liquid=51
+        first=self.w.withdraw(A,None,password='test',reuse_existing=True)
+        plan=self.w.store().get_plan(first['plan'])
+        self.assertEqual(plan['payments'][0]['amount_nano'],50)
+        self.fake.liquid=1000
+        again=self.w.withdraw(A,None,password='test',reuse_existing=True)
+        self.assertEqual(first['plan'],again['plan'])
+        self.assertEqual(self.w.store().get_plan(first['plan']),plan)
+        self.assertEqual(sum(isinstance(x,tuple) for x in self.fake.calls),1)
+
+    def test_partial_proposal_still_requires_confirmation_before_unlock(self):
+        self.credit(); self.fake.liquid=51
+        seen=[]
+        def reject(plan):
+            seen.append(plan)
+            raise StateError('cancelled')
+        with self.assertRaises(StateError): self.w.withdraw(A,None,confirm=reject,reuse_existing=True)
+        self.assertEqual(seen[0]['withdrawal_limit']['remaining_income_nano'],67)
+        self.assertNotIn('unlock',self.fake.calls)
+
     def test_restoring_pre_withdraw_snapshot_cannot_repeat_income_withdrawal(self):
         self.credit(); path=self.root/'.payout-state/journal.sqlite3'; old=path.read_bytes()
         first=self.w.withdraw(A,None,password='test',reuse_existing=True)

@@ -130,7 +130,8 @@ class LiveAdapter:
         return self.client.send_payment(to_pk=payment['recipient'],from_pk=self.config['SEND_FROM_ADDRESS'],amount=payment['amount_nano'],fee=payment['fee_nano'],memo=payment['memo'],nonce=nonce)
 
 class Workflow:
-    def __init__(self,config,root=PROJECT,*,state_dir=None,adapter=None):
+    def __init__(self,config,root=PROJECT,*,state_dir=None,adapter=None,readonly=False):
+        self.readonly=readonly
         self.config=config; self.root=Path(root).resolve(); self.state_dir=Path(state_dir).resolve() if state_dir else self.root/'.payout-state'
         self.wallet=validate_address(config['SEND_FROM_ADDRESS']); self.network=config['EXPECTED_CHAIN_ID']
         if not self.network: raise StateError('expected network is required')
@@ -141,11 +142,27 @@ class Workflow:
             # Rendering cannot turn a durable receipt into an uncertain send.
             try: self.observer(event,**data)
             except Exception: pass
-    def health(self,**kwargs):
+    def health(self,*,retry_archive=False,**kwargs):
         self._emit('health_start')
-        result=self.adapter.health(**kwargs)
-        self._emit('health_ok',health=result)
-        return result
+        import preflight
+        import time
+        from payout_display import paint
+        # Retry this read alone. Never re-enter withdraw/send, recreate a plan,
+        # repeat a password prompt or reuse stale health after an ingest race.
+        attempts=3 if retry_archive else 1
+        for attempt in range(attempts):
+            try:
+                result=self.adapter.health(**kwargs)
+            except preflight.PreflightArchiveLagError:
+                if attempt+1==attempts: raise
+                if attempt==0:
+                    print(paint('Архив ещё загружает свежий блок. Повторяю только проверку каждые 15 секунд, до 3 попыток.','yellow'),flush=True)
+                time.sleep(15)
+            else:
+                if attempt:
+                    print(paint('Архив догнал валидатор. Продолжаю свежие проверки перед отправкой.','green'),flush=True)
+                self._emit('health_ok',health=result)
+                return result
     def tx_depth(self,plan):
         return integer(self.config.get('TX_CONFIRMATIONS_NUM',plan.get('min_confirmations',3)), 'TX_CONFIRMATIONS_NUM', 1)
 
@@ -155,9 +172,13 @@ class Workflow:
         for digest,plan,_ in store.settled_plans(self.wallet,self.network):
             owner_income.record_payout(store,digest,plan,store.list_intents(plan_digest=digest),self.config,nonce)
 
-    def _verify_previous(self,store,health,*,current_digest=None,next_epoch=None):
+    def _verify_previous(self,store,health,*,current_digest=None,next_epoch=None,verify_batches=True):
         """Fresh exact proofs before a new operation; never infer success from age."""
         next_depth=integer(self.config.get('PREVIOUS_PAYOUT_CONFIRMATIONS_NUM',15),'PREVIOUS_PAYOUT_CONFIRMATIONS_NUM',1)
+        if verify_batches:
+            from batch_accounting import verify_history
+            verify_history(self.state_dir,self.config,self.wallet,self.network,
+                           required_depth=max(15,self.tx_depth({}),next_depth) if next_epoch is not None else max(3,self.tx_depth({})),exclude=current_digest)
         for record in store.historical_records():
             if record['metadata'].get('kind')!='initialization': continue
             baseline=json.loads(record['payload'])
@@ -168,6 +189,11 @@ class Workflow:
         expected=[]
         for digest,plan in store.list_plans(self.wallet,self.network):
             if digest==current_digest: continue
+            from payout_batch_state import is_batch_plan
+            if is_batch_plan(plan):
+                if store.settlement(digest) is None:
+                    raise StateError('Предыдущая пакетная эпоха не сверена.')
+                continue  # Exact zkApp proofs are checked by verify_history.
             intents=store.list_intents(plan_digest=digest)
             if not intents: continue
             if store.settlement(digest) is None:
@@ -218,8 +244,8 @@ class Workflow:
         for (_,_,_,required),depth in zip(expected,depths):
             groups.setdefault(required,[]).append(depth)
         self._emit('previous_ok',groups={required:{'count':len(values),'depth':min(values)} for required,values in groups.items()})
-    def store(self):
-        store=StateStore(self.state_dir)
+    def store(self, *, readonly=False):
+        store=StateStore(self.state_dir,readonly=readonly or self.readonly)
         if not any(r['metadata'].get('kind')=='initialization' and r['metadata']['network']==self.network and json.loads(r['payload']).get('wallet')==self.wallet for r in store.historical_records()):
             raise StateError('state initialization/import is incomplete or bound to another wallet/network')
         for record in store.historical_records():
@@ -235,7 +261,7 @@ class Workflow:
         if not path.exists():
             # Once imported, deletion must not silently turn private accounting off.
             if (self.state_dir/'journal.sqlite3').exists():
-                for r in StateStore(self.state_dir).historical_records():
+                for r in StateStore(self.state_dir,readonly=self.readonly).historical_records():
                     if r['metadata'].get('kind')=='initialization' and 'payout_ledger.json' in json.loads(r['payload']).get('files',{}):
                         raise StateError('imported private ledger is missing')
             return None
@@ -251,9 +277,14 @@ class Workflow:
         balances=dict(plan['carry_before_nano'])
         for address,amount in plan['gross_nano'].items(): balances[address]=balances.get(address,0)+amount
         for intent in intents:
+            if plan.get('policy',{}).get('transport')=='zkapp_batch' and plan.get('policy',{}).get('network_fee_source','validator')=='delegators':
+                address=intent['payment']['recipient']
+                balances[address]=balances.get(address,0)-intent['payment']['fee_nano']
             if intent['status']=='confirmed':
                 address=intent['payment']['recipient']
                 balances[address]=balances.get(address,0)-intent['payment']['amount_nano']
+                if plan.get('policy',{}).get('network_fee_source','validator')=='delegators' and plan.get('policy',{}).get('transport')!='zkapp_batch':
+                    balances[address]-=intent['payment']['fee_nano']
         return {a:n for a,n in balances.items() if n}
 
     def _ledger_entry(self, plan, digest, balances):
@@ -298,6 +329,7 @@ class Workflow:
         store=self.store(); data=self._checked_ledger(store)
         return {a:mina_to_nano(v,allow_negative=True) for a,v in data['balances'].items()} if data is not None else store.carry_balances(self.wallet,self.network)
     def initialize(self,*,import_legacy=False):
+        if self.readonly:raise StateError('read-only workflow cannot initialize accounting')
         with wallet_lock(self.state_dir,self.wallet):
             if (self.state_dir/'journal.sqlite3').exists(): raise StateError('journal already exists; do not reinitialize financial state')
             artifacts=list(self.root.glob('*.csv'))
@@ -336,6 +368,8 @@ class Workflow:
                 raise StateError('legacy payout artifacts are unreconciled; verify/import historical accounting before proceeding')
     def _check_plan(self,plan,health,kind='payout'):
         if plan.get('kind','payout')!=kind: raise StateError('wrong operation kind')
+        if kind=='payout' and plan.get('policy',{}).get('network_fee_source','validator') not in ('delegators','validator'):
+            raise StateError('unknown immutable payout network fee source')
         if plan['wallet']!=self.wallet or plan['network']!=self.network or str(health['era'])!=plan['era'] or health['network']!=self.network:
             raise StateError('immutable plan network, era or wallet mismatch')
         if kind=='payout' and (not health.get('epoch_closed') or plan['epoch']>=health['current_epoch']): raise StateError('active epochs are preview only')
@@ -362,7 +396,7 @@ class Workflow:
         memo=f'p{era}e{epoch}:'+fingerprint(seed)[:16]
         plan=dict(seed,kind='payout',gross_nano=calculation['gross_nano'],carry_before_nano=calculation['carry_before_nano'],
                   policy=calculation['policy'],input_fingerprint=fingerprint(inputs),min_confirmations=integer(self.config.get('TX_CONFIRMATIONS_NUM',3),'TX_CONFIRMATIONS_NUM',1),
-                  payments=[{'recipient':a,'amount_nano':n,'fee_nano':calculation['policy']['fee_nano'],'memo':memo} for a,n in sorted(calculation['net_nano'].items())])
+                  payments=[{'recipient':a,'amount_nano':n,'fee_nano':calculation.get('payment_fees_nano',{}).get(a,calculation['policy']['fee_nano']),'memo':memo} for a,n in sorted(calculation['net_nano'].items())])
         self._check_plan(plan,health)
         digest=store.create_plan(plan); store.bind_plan(digest)
         atomic_write_json(self.state_dir/(digest+'.plan.json'),plan)
@@ -405,33 +439,62 @@ class Workflow:
                 conflicts=[p for p in chain if p.get('wallet')==self.wallet and p.get('nonce')==i['nonce'] and p.get('depth',-1)>=plan['min_confirmations'] and p.get('on_best_chain') is True and p.get('status')=='applied']
                 if conflicts and write: store.resolve_failed(i['id'],dict(conflicts[0],kind='nonce_consumed'))
         return store.list_intents(plan_digest=digest)
-    def _funds(self,store,plan,intents,health):
-        indices={i['payment_index'] for i in intents}
-        remaining=sum(p['amount_nano']+p['fee_nano'] for j,p in enumerate(plan['payments']) if j not in indices)
+    def _available_funds(self,store,health,reserve):
         # Conservative: included-but-shallow local commitments may already be
         # reflected in liquid. Double reservation is safe; missing one is not.
         pending=store.pending_commitments(self.wallet,network=self.network)
-        reserve=sum(max(0,n) for n in (plan.get('calculation',{}).get('carry_after_nano',{}) if plan.get('kind','payout')=='payout' else self.carry()).values())
         all_pending=[i for i in store.list_intents(self.wallet,network=self.network) if i['status'] in ('reserved','unknown','submitted')]
         overlap=0
         for row in health.get('pooled_commands',[]):
             if row.get('isDelegation'): continue
             identity=command_identity(row)
             if any(same_payment(i,identity) for i in all_pending): overlap+=identity['amount_nano']+identity['fee_nano']
-        commitments=pending+health['mempool_pending_nano']-overlap
+        from batch_accounting import readonly_snapshot
+        batch_reserved=readonly_snapshot(self.state_dir,self.wallet,self.network)['reserved_nano']
+        commitments=pending+health['mempool_pending_nano']-overlap+batch_reserved
         available=health['account']['liquid_nano']-commitments-reserve
-        if remaining>available: raise StateError('insufficient uncommitted liquid balance after fees and owed reserves')
-        result={'remaining_nano':remaining,'reserved_nano':reserve,'available_nano':available}
+        return {'liquid_nano':health['account']['liquid_nano'],'commitments_nano':commitments,
+                'reserved_nano':reserve,'available_nano':available}
+    def _funds(self,store,plan,intents,health):
+        indices={i['payment_index'] for i in intents}
+        remaining=sum(p['amount_nano']+p['fee_nano'] for j,p in enumerate(plan['payments']) if j not in indices)
+        reserve=sum(max(0,n) for n in (plan.get('calculation',{}).get('carry_after_nano',{}) if plan.get('kind','payout')=='payout' else self.carry()).values())
+        funds=self._available_funds(store,health,reserve)
+        available=funds['available_nano']; commitments=funds['commitments_nano']
+        if remaining>available:
+            raise StateError('Недостаточно свободных средств на кошельке после резервов.\n'
+                '  Доступный баланс кошелька: {:.9f} MINA\n'
+                '  Незавершённые переводы с комиссиями: {:.9f} MINA\n'
+                '  Резерв переносимых обязательств: {:.9f} MINA\n'
+                '  Свободно после резервов: {:.9f} MINA\n'
+                '  Нужно для оставшихся переводов с комиссиями: {:.9f} MINA\n'
+                '  Недостаёт: {:.9f} MINA. Суммы и резервы автоматически не уменьшаются.'.format(
+                    nano_to_mina(health['account']['liquid_nano']),nano_to_mina(commitments),
+                    nano_to_mina(reserve),nano_to_mina(available),nano_to_mina(remaining),
+                    nano_to_mina(remaining-available)))
+        result=dict(funds,remaining_nano=remaining)
         self._emit('funds_ok',funds=result)
         return result
     def send(self,digest,*,password=None,confirm=None,dry_run=False):
         with wallet_lock(self.state_dir,self.wallet):
             return self._send(digest,password=password,confirm=confirm,dry_run=dry_run,kind='payout')
+    def needs_send(self,digest):
+        store=self.store();plan=store.get_plan(digest)
+        from payout_batch_state import is_batch_plan
+        if is_batch_plan(plan):
+            from payout_batch import needs_send
+            return needs_send(self,plan,digest)
+        return len(store.list_intents(plan_digest=digest))<len(plan['payments'])
     def _send(self,digest,*,password=None,confirm=None,dry_run=False,kind='payout'):
         store=self.store(); plan=store.get_plan(digest)
+        from payout_batch_state import is_batch_plan
+        if is_batch_plan(plan):
+            if kind!='payout':raise StateError('batch requires an epoch payout')
+            from payout_batch import send
+            return send(self,store,plan,digest,password=password,confirm=confirm,dry_run=dry_run)
         self._checked_ledger(store)
         self._unsettled(store,except_digest=digest)
-        health=self.health(epoch=plan['epoch'] if kind=='payout' else None,wallet=True)
+        health=self.health(epoch=plan['epoch'] if kind=='payout' else None,wallet=True,retry_archive=True)
         if kind=='withdrawal':
             import owner_income
             owner_income.verify_auto_reservation(store,digest,health)
@@ -453,7 +516,7 @@ class Workflow:
         if password is None: raise StateError('wallet password/confirmation required')
         # User prompts can take minutes. Revalidate health, identity, nonce and
         # funds immediately before unlock while retaining the same wallet lock.
-        health=self.health(epoch=plan['epoch'] if kind=='payout' else None,wallet=True)
+        health=self.health(epoch=plan['epoch'] if kind=='payout' else None,wallet=True,retry_archive=True)
         if kind=='withdrawal':
             import owner_income
             owner_income.verify_auto_reservation(store,digest,health)
@@ -489,6 +552,10 @@ class Workflow:
     def reconcile(self,digest,*,commit=False):
         with wallet_lock(self.state_dir,self.wallet):
             store=self.store(); plan=store.get_plan(digest); kind=plan.get('kind','payout')
+            from payout_batch_state import is_batch_plan
+            if is_batch_plan(plan):
+                from payout_batch import reconcile
+                return reconcile(self,store,plan,digest,commit=commit)
             health=self.health(epoch=plan['epoch'] if kind=='payout' else None,wallet=True)
             self._check_plan(plan,health,kind); chain,pool=self._evidence(plan,health)
             intents=store.list_intents(plan_digest=digest); self._replay_guard(plan,chain,pool,intents)
@@ -497,29 +564,33 @@ class Workflow:
             intents=self._refresh(store,plan,digest,chain,pool)
             self._emit('proofs',plan=plan,intents=intents,chain=chain,pool=pool,required_depth=self.tx_depth(plan))
             if len(intents)!=len(plan['payments']) or any(i['status'] not in ('confirmed','failed') for i in intents): raise PendingPayments('pending/unknown or unsent payments: no financial commit')
-            existing=store.settlement(digest)
-            data=self._checked_ledger(store,recover_digest=digest if existing is None and kind=='payout' else None)
-            if kind=='withdrawal' and existing is not None:
-                return {'plan':digest,'balances_nano':existing,'already_settled':True}
-            balances=self.carry() if kind=='withdrawal' else self._payout_balances(plan,intents)
-            if existing is not None:
-                if existing!=balances: raise StateError('settled accounting mismatch')
-                import owner_income
-                owner_income.record_payout(store,digest,plan,intents,self.config,health['account']['nonce'])
-                return {'plan':digest,'balances_nano':balances,'already_settled':True}
-            if data is not None and kind=='payout':
-                entries=[h for h in data['history'] if h.get('plan_digest')==digest]
-                if not entries:
-                    current={a:mina_to_nano(v,allow_negative=True) for a,v in data['balances'].items()}
-                    if current!=plan['carry_before_nano']: raise StateError('ledger changed after plan snapshot')
-                    import ledger
-                    data['balances']={a:nano_to_mina(n) for a,n in balances.items()}
-                    data['history'].append(self._ledger_entry(plan,digest,balances))
-                    ledger.save(data,self.root/'payout_ledger.json')
-            store.settle(digest,balances)
+            return self._commit_accounting(store,plan,digest,intents,health,kind)
+
+    def _commit_accounting(self,store,plan,digest,intents,health,kind):
+        existing=store.settlement(digest)
+        data=self._checked_ledger(store,recover_digest=digest if existing is None and kind=='payout' else None)
+        if kind=='withdrawal' and existing is not None:
+            return {'plan':digest,'balances_nano':existing,'already_settled':True}
+        balances=self.carry() if kind=='withdrawal' else self._payout_balances(plan,intents)
+        if existing is not None:
+            if existing!=balances: raise StateError('settled accounting mismatch')
             import owner_income
             owner_income.record_payout(store,digest,plan,intents,self.config,health['account']['nonce'])
-            return {'plan':digest,'balances_nano':balances,'already_settled':False}
+            return {'plan':digest,'balances_nano':balances,'already_settled':True}
+        if data is not None and kind=='payout':
+            entries=[h for h in data['history'] if h.get('plan_digest')==digest]
+            if not entries:
+                current={a:mina_to_nano(v,allow_negative=True) for a,v in data['balances'].items()}
+                if current!=plan['carry_before_nano']: raise StateError('ledger changed after plan snapshot')
+                import ledger
+                data['balances']={a:nano_to_mina(n) for a,n in balances.items()}
+                data['history'].append(self._ledger_entry(plan,digest,balances))
+                ledger.save(data,self.root/'payout_ledger.json')
+        store.settle(digest,balances)
+        import owner_income
+        owner_income.record_payout(store,digest,plan,intents,self.config,health['account']['nonce'])
+        return {'plan':digest,'balances_nano':balances,'already_settled':False}
+
     def withdraw(self,recipient,amount_nano,*,password=None,confirm=None,dry_run=False,operation_id=None,reuse_existing=False,new_operation=False):
         import owner_income
         validate_address(recipient)
@@ -527,9 +598,10 @@ class Workflow:
         if not automatic: integer(amount_nano,'withdrawal amount',1)
         with wallet_lock(self.state_dir,self.wallet):
             store=self.store(); self._unsettled(store)
-            health=self.health(wallet=True)
+            health=self.health(wallet=True,retry_archive=True)
             if not dry_run: self._sync_owner_income(store,health['account']['nonce'])
             income=owner_income.summary(store,self.wallet,self.network)
+            withdrawal_limit=None
             if automatic:
                 if new_operation: raise StateError('--new-operation требует явно заданной суммы; автоматический вывод использует только остаток дохода.')
                 pending=[(d,p) for d,p in store.list_plans(self.wallet,self.network) if p.get('kind')=='withdrawal' and store.settlement(d) is None]
@@ -547,12 +619,20 @@ class Workflow:
                     raise StateError('unknown withdrawal operation ID')
                 else:
                     owner_income.check_external_spends(store,self.wallet,self.network,health,income)
-                    amount_nano=income['available_nano']-integer(self.config['DEFAULT_TX_FEE'],'fee')
+                    fee=integer(self.config['DEFAULT_TX_FEE'],'fee')
+                    withdrawal_limit=self._available_funds(store,health,sum(max(0,n) for n in self.carry().values()))
+                    affordable=max(0,min(income['available_nano'],withdrawal_limit['available_nano']))
+                    total=affordable if affordable>fee else 0
+                    withdrawal_limit.update(requested_nano=income['available_nano'],withdrawal_total_nano=total,
+                                            remaining_income_nano=income['available_nano']-total)
+                    amount_nano=max(0,total-fee)
                     if amount_nano<=0:
-                        self._emit('income',summary=income,amount_nano=0,fee_nano=self.config['DEFAULT_TX_FEE'])
-                        return {'nothing_to_withdraw':True,'owner_income':income,'dry_run':dry_run}
+                        self._emit('income',summary=income,amount_nano=0,fee_nano=fee,withdrawal_limit=withdrawal_limit)
+                        return {'nothing_to_withdraw':True,'owner_income':income,'dry_run':dry_run,
+                                'nothing_to_withdraw_reason':'liquidity' if income['available_nano']>fee else 'income',
+                                'withdrawal_limit':withdrawal_limit}
                     operation_id=str(uuid.uuid4())
-            self._emit('income',summary=income,amount_nano=amount_nano,fee_nano=self.config['DEFAULT_TX_FEE'])
+            self._emit('income',summary=income,amount_nano=amount_nano,fee_nano=self.config['DEFAULT_TX_FEE'],withdrawal_limit=withdrawal_limit)
             if new_operation and operation_id is not None:
                 raise StateError('choose an existing operation ID or --new-operation, not both')
             if reuse_existing and operation_id is None:
@@ -573,6 +653,7 @@ class Workflow:
             plan={'wallet':self.wallet,'network':self.network,'era':str(health['era']),'epoch':health['current_epoch'],'kind':'withdrawal','operation_id':operation_id,'withdrawal_source':'auto' if automatic else 'manual',
                   'min_confirmations':integer(self.config.get('TX_CONFIRMATIONS_NUM',3),'TX_CONFIRMATIONS_NUM',1),
                   'payments':[{'recipient':recipient,'amount_nano':amount_nano,'fee_nano':integer(self.config['DEFAULT_TX_FEE'],'fee'),'memo':str(self.config.get('WITHDRAW_MEMO',''))}]}
+            if withdrawal_limit is not None: plan['withdrawal_limit']=withdrawal_limit
             if existing:
                 digest,old=existing[0]
                 if old['payments']!=plan['payments']: raise StateError('withdrawal operation identity already has different immutable inputs')
@@ -580,7 +661,7 @@ class Workflow:
             elif dry_run:
                 self._verify_previous(store,health)
                 self._check_plan(plan,health,'withdrawal')
-                return dict(self._funds(store,plan,[],health),dry_run=True,operation_id=operation_id,amount_nano=amount_nano,fee_nano=plan['payments'][0]['fee_nano'],owner_income=income)
+                return dict(self._funds(store,plan,[],health),dry_run=True,operation_id=operation_id,amount_nano=amount_nano,fee_nano=plan['payments'][0]['fee_nano'],owner_income=income,withdrawal_limit=withdrawal_limit)
             else:
                 if any(i['status'] not in ('confirmed','failed') for i in store.list_intents(self.wallet,network=self.network)): raise StateError('unresolved wallet operation blocks new withdrawal')
                 self._verify_previous(store,health)

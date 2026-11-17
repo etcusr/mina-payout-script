@@ -23,7 +23,7 @@ class ApplicationTests(unittest.TestCase):
         self.data={'stakes':[{'public_key':A,'balance':'1','timing':None}], 'blocks':[{'reward_nano':100,'snark_nano':0,'fees_nano':0,'slot':1,'winner':A,'state_hash':'block','height':1}], 'base_coinbase_nano':100,'ledger_hash':'ledger','report':{'blocks':[{'mature':True,'lost':False}]},'foundation':[],'labs':[]}
     def test_calculate_export_send_reconcile_end_to_end(self):
         result=payout_app.calculate_epoch(self.w,8,provider=lambda w,e,h:self.data)
-        self.assertEqual((self.root/'e8_payouts.csv').read_text(),f'{A};100;0.000000100\n')
+        self.assertEqual((self.root/'e8_payouts.csv').read_text(),f'{A};99;0.000000099\n')
         self.w.send(result['plan'],password='x'); self.fake.include(); self.w.reconcile(result['plan'],commit=True)
         self.assertEqual(self.w.carry(),{})
     def test_active_preview_does_not_create_plan_or_legacy_export(self):

@@ -83,6 +83,38 @@ class ConfirmationRetryTests(unittest.TestCase):
                 payout_cli.complete_accounting(self.w,self.digest,60,'mina_pay --epoch 8')
         ensure.assert_not_called(); self.assertIsNone(self.w.store().settlement(self.digest))
 
+    def test_archive_lag_recovers_without_restarting_tunnel_or_resending(self):
+        health=self.fake.health; calls=[]
+        def lag_once(*args,**kwargs):
+            calls.append(True)
+            if len(calls)==1: raise preflight.PreflightArchiveLagError('archive is one block behind')
+            self.fake.include(3)
+            return health(*args,**kwargs)
+        self.fake.health=lag_once
+        with patch.object(payout_cli.tunnel,'ensure') as ensure,patch('time.sleep'),contextlib.redirect_stdout(io.StringIO()) as output:
+            result=payout_cli.complete_accounting(self.w,self.digest,60,'mina_pay --epoch 8')
+        self.assertTrue(result['settled']); ensure.assert_not_called()
+        self.assertIn('Архив',output.getvalue())
+        self.assertEqual(sum(isinstance(x,tuple) for x in self.fake.calls),1)
+        self.assertEqual(self.fake.calls.count('unlock'),1)
+
+    def test_archive_lag_timeout_preserves_pending_intent_and_prints_honest_report(self):
+        with patch.object(self.fake,'health',side_effect=preflight.PreflightArchiveLagError('lag')),patch.object(payout_cli.tunnel,'ensure') as ensure,contextlib.redirect_stdout(io.StringIO()) as output:
+            result=payout_cli.complete_accounting(self.w,self.digest,0,'mina_pay --epoch 8')
+            payout_cli.completion_report(result)
+        self.assertFalse(result['settled']); self.assertEqual(result['pending_reason'],'archive_lag')
+        self.assertIn('архив',output.getvalue().lower()); ensure.assert_not_called()
+        self.assertIsNone(self.w.store().settlement(self.digest))
+        self.assertEqual(self.w.store().list_intents()[0]['status'],'submitted')
+
+    def test_persistent_archive_lag_stops_at_deadline_without_repeated_warning(self):
+        clock=[0]
+        with patch.object(self.fake,'health',side_effect=preflight.PreflightArchiveLagError('lag')),patch('time.monotonic',side_effect=lambda:clock[0]),patch('time.sleep',side_effect=lambda _:clock.__setitem__(0,clock[0]+15)),contextlib.redirect_stdout(io.StringIO()) as output:
+            result=payout_cli.complete_accounting(self.w,self.digest,30,'mina_pay --epoch 8')
+        self.assertFalse(result['settled']); self.assertEqual(clock[0],30)
+        self.assertEqual(output.getvalue().count('Архив ещё'),1)
+        self.assertEqual(sum(isinstance(x,tuple) for x in self.fake.calls),1)
+
     def test_terminal_progress_finishes_on_timeout_and_interrupt(self):
         from payout_display import PayoutDisplay
         for interrupted in (False,True):

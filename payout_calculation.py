@@ -43,7 +43,21 @@ def policy(config,era,epoch):
         if not 0<=rate<=1: raise ValueError('commission must be between zero and one')
         result[key]=str(rate)
     result['minimum_nano']=mina_to_nano(config.get('MINIMUM_PAYOUT','0'))
-    result['fee_nano']=integer(config.get('DEFAULT_TX_FEE',0),'fee')
+    transport=config.get('PAYOUT_TRANSPORT','payment')
+    if transport not in ('payment','zkapp_batch'):
+        raise ValueError('PAYOUT_TRANSPORT must be payment or zkapp_batch')
+    # Preserve the policy shape of callers that predate transport selection.
+    if 'PAYOUT_TRANSPORT' in config: result['transport']=transport
+    if transport=='zkapp_batch':
+        size=integer(config.get('PAYOUT_BATCH_SIZE',30),'batch size',1)
+        if size>30: raise ValueError('PAYOUT_BATCH_SIZE must be between 1 and 30')
+        result['batch_size']=size
+        result['fee_nano']=integer(config.get('PAYOUT_BATCH_FEE_NANO',config.get('DEFAULT_TX_FEE',0)),'batch fee',1)
+    else:
+        result['fee_nano']=integer(config.get('DEFAULT_TX_FEE',0),'fee')
+    result['network_fee_source']=config.get('PAYOUT_NETWORK_FEE_SOURCE','delegators')
+    if result['network_fee_source'] not in ('delegators','validator'):
+        raise ValueError('PAYOUT_NETWORK_FEE_SOURCE must be delegators or validator')
     result['exclusions']=sorted(config.get('EXCLUDE_FROM_PAYOUTS',[config['SEND_FROM_ADDRESS'],config['VALIDATOR_ADDRESS']]))
     result['redirects']={src:[(dst,str(weight)) for dst,weight in targets] for src,targets in redirects.parse(config.get('PAYOUT_REDIRECTS')).items()}
     result['rounding']='floor each staking allocation; last sorted redirect receives remainder; validator retains subnano allocation remainder'
@@ -85,13 +99,31 @@ def calculate(config,era,epoch,stakes,blocks,*,base_coinbase_nano,carry,foundati
                 excluded+=value
                 excluded_by_address[dst]=excluded_by_address.get(dst,0)+value
             else: gross[dst]=gross.get(dst,0)+value
-    net={}; after={}
+    owed_by_address={}
     for a in sorted(set(gross)|set(carry)):
         validate_address(a)
         if type(carry.get(a,0)) is not int: raise ValueError('carry must be integer nanomina')
-        owed=gross.get(a,0)+carry.get(a,0)
-        amount=owed if owed>0 and owed>=p['minimum_nano'] else 0
-        if amount: net[a]=amount
-        if owed-amount: after[a]=owed-amount
+        owed_by_address[a]=gross.get(a,0)+carry.get(a,0)
+    candidates=[a for a,owed in owed_by_address.items() if owed>0 and owed>=p['minimum_nano']]
+    delegator_funded=p['network_fee_source']=='delegators'
+    while True:
+        payment_fees={}
+        if p.get('transport','payment')=='zkapp_batch':
+            for start in range(0,len(candidates),p['batch_size']):
+                group=candidates[start:start+p['batch_size']]
+                share,remainder=divmod(p['fee_nano'],len(group))
+                payment_fees.update((a,share+(i<remainder)) for i,a in enumerate(group))
+        else:
+            payment_fees={a:p['fee_nano'] for a in candidates}
+        net={a:owed_by_address[a]-(payment_fees[a] if delegator_funded else 0) for a in candidates}
+        selected=[a for a in candidates if net[a]>0 and net[a]>=p['minimum_nano']]
+        if selected==candidates: break
+        # Removing recipients can change both group membership and fee shares.
+        # Never charge a removed recipient; their entire entitlement carries.
+        candidates=selected
+    delegator_fees={a:fee for a,fee in payment_fees.items() if delegator_funded and fee}
+    after={a:owed-net.get(a,0)-delegator_fees.get(a,0) for a,owed in owed_by_address.items()}
+    after={a:amount for a,amount in after.items() if amount}
     return {'gross_nano':gross,'net_nano':net,'carry_before_nano':dict(carry),'carry_after_nano':after,
+            'delegator_fees_nano':delegator_fees,'payment_fees_nano':payment_fees,
             'validator_nano':total-allocated,'excluded_nano':excluded,'excluded_by_address_nano':excluded_by_address,'total_reward_nano':total,'policy':p}

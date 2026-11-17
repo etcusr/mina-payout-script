@@ -5,6 +5,24 @@ from unittest.mock import patch
 
 
 class DiagnosticOutputTests(unittest.TestCase):
+    def test_partial_withdrawal_proposal_shows_reserve_shortfall_and_clear_confirmation(self):
+        from payout_display import PayoutDisplay
+        import payout_cli
+        from payout_state import StateError
+        from tests.test_calculation import A
+        limit={'requested_nano':118,'liquid_nano':151,'commitments_nano':0,'reserved_nano':100,
+               'available_nano':51,'remaining_income_nano':67,'withdrawal_total_nano':51}
+        summary={'credits':[],'earned_nano':118,'withdrawn_with_fees_nano':0,'reserved_with_fees_nano':0}
+        plan={'kind':'withdrawal','epoch':8,'min_confirmations':3,'withdrawal_limit':limit,
+              'payments':[{'recipient':A,'amount_nano':50,'fee_nano':1}]}
+        output=io.StringIO()
+        with contextlib.redirect_stdout(output),patch('builtins.input',return_value='n') as question:
+            PayoutDisplay()('income',summary=summary,amount_nano=50,fee_nano=1,withdrawal_limit=limit)
+            with self.assertRaises(StateError): payout_cli._confirmation(False)(plan)
+        for label in ('ЧАСТИЧНЫЙ','Резерв делегаторов','0.000000067','0.000000100'):
+            self.assertIn(label,output.getvalue())
+        self.assertIn('частичный',question.call_args.args[0].lower())
+
     def test_plan_without_journal_does_not_claim_payments_are_unsent(self):
         from payout_display import PayoutDisplay
         from tests.test_calculation import A

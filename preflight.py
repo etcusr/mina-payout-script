@@ -18,6 +18,30 @@ class PreflightConnectionError(PreflightError):
     """Transport unavailable; a later fresh proof read may be retried."""
 
 
+class PreflightArchiveLagError(PreflightError):
+    """A recent missing tip with a matching ancestor; retry proof reads only."""
+
+
+def _recent_archive_lag(connection, snapshot, tip_height):
+    """Classify only a short missing suffix, never a mismatched/orphaned row.
+
+    This is not successful health evidence. The next attempt must run the
+    complete check from a new producer snapshot and database transaction.
+    """
+    latest = _rows(connection, 'SELECT MAX(height) AS h FROM blocks')[0]['h']
+    if latest is None or not 1 <= tip_height-latest <= 3:
+        return None
+    ancestors = [b for b in snapshot if
+                 _integer(b['protocolState']['consensusState']['blockchainLength'], 'snapshot height') == latest]
+    if len(ancestors) != 1:
+        return None
+    ancestor = _rows(connection, 'SELECT height,chain_status FROM blocks WHERE state_hash=%(hash)s',
+                     {'hash': ancestors[0]['stateHash']})
+    if len(ancestor) == 1 and ancestor[0]['height'] == latest and ancestor[0]['chain_status'] != 'orphaned':
+        return latest
+    return None
+
+
 def _integer(value, label):
     if isinstance(value, bool) or not re.fullmatch(r'[0-9]+', str(value)):
         raise PreflightError('Invalid ' + label)
@@ -128,6 +152,11 @@ def check(config, epoch=None, require_wallet=False, *, min_height=None):
           WHERE b.chain_status='pending' AND b.height<=c.h''')[0]['n']
         if stale: raise PreflightError('Archive has unresolved pending blocks below its canonical frontier')
         head = _rows(connection, 'SELECT * FROM blocks WHERE state_hash=%(hash)s', {'hash': tip_hash})
+        if not head:
+            archive_height = _recent_archive_lag(connection, snapshot, tip_height)
+            if archive_height is not None:
+                raise PreflightArchiveLagError(
+                    'Свежая вершина валидатора ещё не загружена в архив: валидатор {}, архив {}.'.format(tip_height, archive_height))
         if len(head) != 1 or head[0]['height'] != tip_height or head[0]['chain_status'] == 'orphaned':
             raise PreflightError('Producer best tip is missing, mismatched or orphaned in archive; retry after archive catches up')
         if head[0]['global_slot_since_hard_fork']//spe != current_epoch:
